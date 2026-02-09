@@ -1,0 +1,7 @@
+/vendor/
+/rust/target/
+/bin/turbo-composer
+/bin/turbo-composer-*
+/benchmarks/results/
+.phpunit.result.cache
+composer.lock

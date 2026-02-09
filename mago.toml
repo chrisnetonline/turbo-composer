@@ -1,0 +1,39 @@
+php-version = "8.1"
+
+[source]
+paths = ["src", "tests"]
+
+[linter.rules.cyclomatic-complexity]
+# TurboAutoloadGenerator orchestrates parallel Rust execution + parent::dump + file writing — inherently branchy.
+threshold = 45
+
+[linter.rules.kan-defect]
+threshold = 5.0
+
+[linter.rules.excessive-parameter-list]
+# Composer's AutoloadGenerator::dump() requires 9 parameters — can't reduce without breaking the override.
+threshold = 10
+
+[linter.rules.no-boolean-flag-parameter]
+# Composer's API forces boolean flag parameters in setDevMode() and dump() — can't refactor away.
+enabled = false
+
+[linter.rules.halstead]
+# dump() orchestrates parallel Rust execution, suffix resolution, fallback logic, and file writing.
+effort-threshold = 12000.0
+volume-threshold = 1500.0
+
+[linter.rules.too-many-methods]
+threshold = 15
+
+[linter.rules.too-many-properties]
+threshold = 15
+
+[linter.rules.literal-named-argument]
+enabled = false
+
+[linter.rules.no-shell-execute-string]
+enabled = false
+
+[linter.rules.no-redundant-file]
+enabled = false

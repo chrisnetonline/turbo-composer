@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  mago:
+    name: Mago (PHP lint + format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.json') }}
+          restore-keys: composer-
+
+      - name: Install dependencies
+        run: composer install --no-interaction
+
+      - name: Check formatting
+        run: vendor/bin/mago fmt --check
+
+      - name: Lint
+        run: vendor/bin/mago lint
+
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-check-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-check-
+
+      - name: cargo check
+        working-directory: rust
+        run: cargo check
+
+      - name: cargo test
+        working-directory: rust
+        run: cargo test
+
+      - name: cargo clippy
+        working-directory: rust
+        run: cargo clippy -- -D warnings
+
+  phpunit:
+    name: PHPUnit (Unit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.json') }}
+          restore-keys: composer-
+
+      - name: Install dependencies
+        run: composer install --no-interaction
+
+      - name: Run unit tests
+        run: vendor/bin/phpunit --testsuite Unit
+
+  correctness:
+    name: PHPUnit (Correctness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry + build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            rust/target
+          key: cargo-release-${{ hashFiles('rust/Cargo.lock') }}
+          restore-keys: cargo-release-
+
+      - name: Build Rust binary
+        working-directory: rust
+        run: cargo build --release
+
+      - name: Install binary
+        run: |
+          mkdir -p bin
+          cp rust/target/release/turbo-composer bin/turbo-composer-linux-x86_64
+
+      - name: Cache Composer dependencies
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: composer-${{ hashFiles('composer.json') }}
+          restore-keys: composer-
+
+      - name: Install PHP dependencies
+        run: composer install --no-interaction
+
+      - name: Run correctness tests
+        run: vendor/bin/phpunit --testsuite Correctness
