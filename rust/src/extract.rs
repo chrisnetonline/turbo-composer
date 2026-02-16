@@ -139,8 +139,8 @@ fn extract_zip(
                 keep[idx] = true;
             }
             let mut write = 0;
-            for read in 0..file_entries.len() {
-                if keep[read] {
+            for (read, &kept) in keep.iter().enumerate() {
+                if kept {
                     file_entries.swap(write, read);
                     write += 1;
                 }
