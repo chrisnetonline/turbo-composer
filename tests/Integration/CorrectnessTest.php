@@ -16,7 +16,6 @@ use function count;
 use function file_exists;
 use function file_get_contents;
 use function file_put_contents;
-use function fwrite;
 use function implode;
 use function is_dir;
 use function json_decode;
@@ -36,7 +35,6 @@ use function uniqid;
 use function unlink;
 
 use const ARRAY_FILTER_USE_KEY;
-use const STDERR;
 
 class CorrectnessTest extends TestCase
 {
@@ -320,16 +318,22 @@ class CorrectnessTest extends TestCase
         }
 
         $extraInTurbo = array_diff_key($turbo, $vanilla);
-        $this->addToAssertionCount(1);
         if (count($extraInTurbo) > 0) {
-            fwrite(STDERR, sprintf(
-                "\n  [%s] Note: turbo has %d extra classes (vanilla=%d, turbo=%d)\n",
+            $extraList = implode("\n    ", array_map(
+                static fn(string $class, string $path): string => "{$class} => {$path}",
+                array_keys($extraInTurbo),
+                array_values($extraInTurbo),
+            ));
+            $this->fail(sprintf(
+                "[%s] turbo has %d extra classes (vanilla=%d, turbo=%d):\n    %s",
                 $fixtureName,
                 count($extraInTurbo),
                 count($vanilla),
                 count($turbo),
+                $extraList,
             ));
         }
+        $this->addToAssertionCount(1);
     }
 
     /**

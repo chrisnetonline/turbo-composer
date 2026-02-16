@@ -263,6 +263,7 @@ class TurboAutoloadGenerator extends AutoloadGenerator
         $psr0 = [];
         $classmap = [];
         $files = [];
+        $excludePatterns = [];
 
         foreach ($packages as $package) {
             if ($package instanceof AliasPackage) {
@@ -277,6 +278,11 @@ class TurboAutoloadGenerator extends AutoloadGenerator
             $psr0 = array_merge($psr0, $entries['psr0']);
             $classmap = array_merge($classmap, $entries['classmap']);
             $files = array_merge($files, $entries['files']);
+
+            $excludePatterns = array_merge($excludePatterns, $this->resolveExcludePatterns(
+                $package->getAutoload(),
+                $installPath,
+            ));
         }
 
         $autoloads = [$rootPackage->getAutoload()];
@@ -290,6 +296,17 @@ class TurboAutoloadGenerator extends AutoloadGenerator
             $psr0 = array_merge($psr0, $entries['psr0']);
             $classmap = array_merge($classmap, $entries['classmap']);
             $files = array_merge($files, $entries['files']);
+        }
+
+        $excludePatterns = array_merge($excludePatterns, $this->resolveExcludePatterns(
+            $rootPackage->getAutoload(),
+            $projectDir,
+        ));
+        if ($this->turboDevMode) {
+            $excludePatterns = array_merge($excludePatterns, $this->resolveExcludePatterns(
+                $rootPackage->getDevAutoload(),
+                $projectDir,
+            ));
         }
 
         $installedVersionsPath = $vendorDir . '/composer/InstalledVersions.php';
@@ -307,8 +324,35 @@ class TurboAutoloadGenerator extends AutoloadGenerator
                 'classmap' => $classmap,
                 'files' => $files,
             ],
-            'exclude_from_classmap' => $rootPackage->getAutoload()['exclude-from-classmap'] ?? [],
+            'exclude_from_classmap' => $excludePatterns,
         ];
+    }
+
+    /**
+     * Resolve exclude-from-classmap patterns to absolute-path-anchored regex strings,
+     * matching Composer's own pattern resolution logic.
+     *
+     * @return list<string>
+     */
+    private function resolveExcludePatterns(array $autoload, string $installPath): array
+    {
+        if (!array_key_exists('exclude-from-classmap', $autoload) || !is_array($autoload['exclude-from-classmap'])) {
+            return [];
+        }
+
+        $patterns = [];
+        foreach ($autoload['exclude-from-classmap'] as $pattern) {
+            $pattern = preg_replace('{/+}', '/', preg_quote(trim(strtr((string) $pattern, '\\', '/'), '/'), '/'));
+            $pattern = strtr($pattern, ['\\*\\*' => '.+?', '\\*' => '[^/]+?']);
+
+            $resolvedPath = realpath($installPath);
+            if ($resolvedPath === false) {
+                continue;
+            }
+            $patterns[] = preg_quote(strtr($resolvedPath, '\\', '/'), '/') . '/' . $pattern . '($|/)';
+        }
+
+        return $patterns;
     }
 
     /**
