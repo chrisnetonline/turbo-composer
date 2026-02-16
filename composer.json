@@ -19,7 +19,8 @@
     },
     "autoload-dev": {
         "psr-4": {
-            "TurboComposer\\Tests\\": "tests/"
+            "TurboComposer\\Tests\\Unit\\": "tests/Unit/",
+            "TurboComposer\\Tests\\Integration\\": "tests/Integration/"
         }
     },
     "extra": {

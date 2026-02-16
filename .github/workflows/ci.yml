@@ -92,8 +92,8 @@ jobs:
       - name: Run unit tests
         run: vendor/bin/phpunit --testsuite Unit
 
-  correctness:
-    name: PHPUnit (Correctness)
+  integration:
+    name: PHPUnit (Integration)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -135,5 +135,5 @@ jobs:
       - name: Install PHP dependencies
         run: composer install --no-interaction
 
-      - name: Run correctness tests
-        run: vendor/bin/phpunit --testsuite Correctness
+      - name: Run integration tests
+        run: vendor/bin/phpunit --testsuite Integration

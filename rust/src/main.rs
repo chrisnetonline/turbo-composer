@@ -38,6 +38,75 @@ struct Input {
     suffix: Option<String>,
     #[serde(default = "default_true")]
     write_files: bool,
+    #[serde(default)]
+    staging_suffix: Option<String>,
+    #[serde(default)]
+    has_platform_check: bool,
+    #[serde(default)]
+    has_files_autoload: bool,
+
+    // Batch command: array of sub-operations
+    #[serde(default)]
+    operations: Vec<serde_json::Value>,
+}
+
+fn dispatch(input: Input) -> serde_json::Value {
+    match input.command.as_str() {
+        "extract" => extract::run(input.packages),
+        "clean" => clean::run(input.targets),
+        "verify" => verify::run(input.verify_targets),
+        "vendor-check" => vendor_state::run(input.check_packages),
+        "classmap" => classmap::run(classmap::ClassmapConfig {
+            project_dir: input.project_dir.unwrap_or_default(),
+            vendor_dir: input.vendor_dir.unwrap_or_default(),
+            autoload: input.autoload.unwrap_or_default(),
+            exclude_from_classmap: input.exclude_from_classmap,
+            target_dir: input.target_dir,
+            suffix: input.suffix,
+            write_files: input.write_files,
+            staging_suffix: input.staging_suffix,
+            has_platform_check: input.has_platform_check,
+            has_files_autoload: input.has_files_autoload,
+        }),
+        "batch" => run_batch(input.operations),
+        other => {
+            eprintln!("unknown command: {other}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_batch(operations: Vec<serde_json::Value>) -> serde_json::Value {
+    let start = std::time::Instant::now();
+    let mut results = Vec::with_capacity(operations.len());
+
+    for op in operations {
+        let command = op
+            .get("command")
+            .and_then(|c| c.as_str())
+            .unwrap_or("")
+            .to_string();
+        let input: Input = match serde_json::from_value(op) {
+            Ok(i) => i,
+            Err(e) => {
+                results.push(serde_json::json!({
+                    "command": command,
+                    "error": format!("failed to parse operation: {e}"),
+                }));
+                continue;
+            }
+        };
+        let result = dispatch(input);
+        results.push(serde_json::json!({
+            "command": command,
+            "result": result,
+        }));
+    }
+
+    serde_json::json!({
+        "results": results,
+        "elapsed_ms": start.elapsed().as_millis() as u64,
+    })
 }
 
 fn main() {
@@ -61,25 +130,7 @@ fn main() {
     let json_parse_ms = parse_start.elapsed().as_millis();
 
     let command_start = std::time::Instant::now();
-    let mut output = match input.command.as_str() {
-        "extract" => extract::run(input.packages),
-        "clean" => clean::run(input.targets),
-        "verify" => verify::run(input.verify_targets),
-        "vendor-check" => vendor_state::run(input.check_packages),
-        "classmap" => classmap::run(
-            input.project_dir.unwrap_or_default(),
-            input.vendor_dir.unwrap_or_default(),
-            input.autoload.unwrap_or_default(),
-            input.exclude_from_classmap,
-            input.target_dir,
-            input.suffix,
-            input.write_files,
-        ),
-        other => {
-            eprintln!("unknown command: {other}");
-            std::process::exit(1);
-        }
-    };
+    let mut output = dispatch(input);
     let command_ms = command_start.elapsed().as_millis();
 
     if let Some(stats) = output.get_mut("stats").and_then(|s| s.as_object_mut()) {

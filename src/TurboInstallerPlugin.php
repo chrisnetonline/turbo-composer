@@ -219,40 +219,86 @@ class TurboInstallerPlugin implements PluginInterface, EventSubscriberInterface
             return;
         }
 
-        $this->dispatchBatch('clean', 'targets', $this->pendingCleanups);
-        $this->dispatchBatch('verify', 'verify_targets', $this->pendingVerifications);
-        $this->dispatchBatch('extract', 'packages', $this->pendingExtractions);
-    }
+        // Batch all pending operations into a single Rust process invocation
+        // to avoid the overhead of spawning multiple processes.
+        $operations = [];
+        $operationCounts = [];
 
-    /**
-     * Dispatch a batch of pending operations to the Rust binary.
-     *
-     * @param array<string, mixed> $queue
-     */
-    private function dispatchBatch(string $command, string $payloadKey, array &$queue): void
-    {
-        if ($queue === []) {
+        if ($this->pendingCleanups !== []) {
+            $operationCounts['clean'] = count($this->pendingCleanups);
+            $operations[] = [
+                'command' => 'clean',
+                'targets' => array_values($this->pendingCleanups),
+            ];
+            $this->pendingCleanups = [];
+        }
+
+        if ($this->pendingVerifications !== []) {
+            $operationCounts['verify'] = count($this->pendingVerifications);
+            $operations[] = [
+                'command' => 'verify',
+                'verify_targets' => array_values($this->pendingVerifications),
+            ];
+            $this->pendingVerifications = [];
+        }
+
+        if ($this->pendingExtractions !== []) {
+            $operationCounts['extract'] = count($this->pendingExtractions);
+            $operations[] = [
+                'command' => 'extract',
+                'packages' => array_values($this->pendingExtractions),
+            ];
+            $this->pendingExtractions = [];
+        }
+
+        if ($operations === []) {
             return;
         }
 
-        $count = count($queue);
         $start = microtime(true);
-        $result = $this->bridge->run([
-            'command' => $command,
-            $payloadKey => array_values($queue),
+
+        // Use batch command when there are multiple operations to save process spawn overhead.
+        // Fall back to individual commands for a single operation (avoids nesting).
+        if (count($operations) === 1) {
+            $result = $this->bridge->run($operations[0]);
+            $elapsed = round((microtime(true) - $start) * 1000);
+            if ($result === null) {
+                $command = $operations[0]['command'];
+                $this->io->writeError(
+                    "<warning>turbo-composer:</warning> Parallel {$command} failed — Composer will handle normally.",
+                );
+                return;
+            }
+            $command = $operations[0]['command'];
+            $this->logBatchResult($command, $result, $operationCounts[$command], $elapsed);
+            return;
+        }
+
+        $batchResult = $this->bridge->run([
+            'command' => 'batch',
+            'operations' => $operations,
         ]);
 
-        $queue = [];
+        $elapsed = round((microtime(true) - $start) * 1000);
 
-        if ($result === null) {
+        if ($batchResult === null) {
             $this->io->writeError(
-                "<warning>turbo-composer:</warning> Parallel {$command} failed — Composer will handle normally.",
+                '<warning>turbo-composer:</warning> Batch operation failed — Composer will handle normally.',
             );
             return;
         }
 
-        $elapsed = round((microtime(true) - $start) * 1000);
-        $this->logBatchResult($command, $result, $count, $elapsed);
+        foreach ($batchResult['results'] ?? [] as $entry) {
+            $command = $entry['command'] ?? '';
+            $result = $entry['result'] ?? null;
+            if ($result === null || ($entry['error'] ?? null) !== null) {
+                $error = $entry['error'] ?? 'unknown';
+                $this->io->writeError("<warning>turbo-composer:</warning> Batch {$command} failed: {$error}");
+                continue;
+            }
+            $count = $operationCounts[$command] ?? 0;
+            $this->logBatchResult($command, $result, $count, $elapsed);
+        }
     }
 
     private function logBatchResult(string $command, array $result, int $count, float $elapsed): void

@@ -7,13 +7,10 @@
          failOnWarning="true">
     <testsuites>
         <testsuite name="Unit">
-            <file>tests/BinaryInstallerTest.php</file>
-            <file>tests/RustBridgeTest.php</file>
-            <file>tests/RustBridgeCommandTest.php</file>
-            <file>tests/TurboAutoloadGeneratorTest.php</file>
+            <directory>tests/Unit</directory>
         </testsuite>
-        <testsuite name="Correctness">
-            <file>tests/CorrectnessTest.php</file>
+        <testsuite name="Integration">
+            <directory>tests/Integration</directory>
         </testsuite>
     </testsuites>
     <source>

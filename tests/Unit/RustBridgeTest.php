@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace TurboComposer\Tests;
+namespace TurboComposer\Tests\Unit;
 
 use Composer\Composer;
 use Composer\Config;
@@ -26,7 +26,7 @@ use function sys_get_temp_dir;
 use function uniqid;
 use function unlink;
 
-class RustBridgeCommandTest extends TestCase
+class RustBridgeTest extends TestCase
 {
     private string $tempDir;
     private string $noFallbackDir;
@@ -74,6 +74,7 @@ class RustBridgeCommandTest extends TestCase
         $this->composer->method('getPackage')->willReturn($rootPackage);
         $this->composer->method('getRepositoryManager')->willReturn($repoManager);
 
+        // Stub getLoop so download attempts fail gracefully via the catch block
         $httpDownloader = $this->createStub(HttpDownloader::class);
         $httpDownloader->method('copy')->willThrowException(new \Exception('Download unavailable in tests'));
 
@@ -92,126 +93,109 @@ class RustBridgeCommandTest extends TestCase
         }
     }
 
-    public function testRunCleanCommandReturnsResult(): void
+    public function testMightBeAvailableReturnsFalseWhenNoBinary(): void
     {
-        $this->placeFakeBinary(output: '{"cleaned":3,"failed":[],"elapsed_ms":12}');
-
         $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
-        $result = $bridge->run([
-            'command' => 'clean',
-            'targets' => [
-                ['path' => '/tmp/pkg1', 'name' => 'vendor/pkg1'],
-                ['path' => '/tmp/pkg2', 'name' => 'vendor/pkg2'],
-                ['path' => '/tmp/pkg3', 'name' => 'vendor/pkg3'],
-            ],
-        ]);
 
-        $this->assertIsArray($result);
-        $this->assertSame(3, $result['cleaned']);
-        $this->assertSame([], $result['failed']);
+        $this->assertFalse($bridge->mightBeAvailable());
     }
 
-    public function testRunClassmapReportsWalkSkipped(): void
+    public function testMightBeAvailableReturnsTrueWithValidBinary(): void
     {
-        $this->placeFakeBinary(
-            output: '{"classmap_count":10,"files_written":false,"stats":{"walk_skipped":true,"walk_ms":5}}',
-        );
+        $this->placeFakeBinary();
+
+        $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
+
+        $this->assertTrue($bridge->mightBeAvailable());
+    }
+
+    public function testIsAvailableReturnsFalseWhenBinaryCannotBeObtained(): void
+    {
+        $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
+
+        $this->assertFalse($bridge->isAvailable());
+    }
+
+    public function testIsAvailableReturnsTrueWithValidBinary(): void
+    {
+        $this->placeFakeBinary();
+
+        $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
+
+        $this->assertTrue($bridge->isAvailable());
+    }
+
+    public function testIsAvailableCachesResult(): void
+    {
+        $this->placeFakeBinary();
+
+        $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
+
+        $this->assertTrue($bridge->isAvailable());
+        // Second call should use cached result, not re-resolve
+        $this->assertTrue($bridge->isAvailable());
+    }
+
+    public function testRunReturnsNullWhenBinaryUnavailable(): void
+    {
+        $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
+
+        $result = $bridge->run(['command' => 'test']);
+
+        $this->assertNull($result);
+    }
+
+    public function testRunReturnsDecodedJsonFromBinary(): void
+    {
+        $this->placeFakeBinary(output: '{"classmap_count":42,"stats":{}}');
 
         $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
         $result = $bridge->run(['command' => 'classmap']);
 
         $this->assertIsArray($result);
-        $this->assertSame(10, $result['classmap_count']);
-        $this->assertTrue($result['stats']['walk_skipped']);
+        $this->assertSame(42, $result['classmap_count']);
+        $this->assertArrayHasKey('stats', $result);
     }
 
-    public function testRunVerifyCommandReturnsResult(): void
+    public function testRunReturnsNullOnNonZeroExit(): void
     {
-        $this->placeFakeBinary(output: '{"verified":5,"failed":[],"total":5,"elapsed_ms":3}');
+        $this->placeFakeBinary(exitCode: 1);
 
         $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
-        $result = $bridge->run([
-            'command' => 'verify',
-            'verify_targets' => [
-                [
-                    'path' => '/tmp/pkg1.zip',
-                    'name' => 'vendor/pkg1',
-                    'algorithm' => 'sha256',
-                    'expected_hash' => 'abc123',
-                ],
-                [
-                    'path' => '/tmp/pkg2.zip',
-                    'name' => 'vendor/pkg2',
-                    'algorithm' => 'sha256',
-                    'expected_hash' => 'def456',
-                ],
-            ],
-        ]);
+        $result = $bridge->run(['command' => 'test']);
 
-        $this->assertIsArray($result);
-        $this->assertSame(5, $result['verified']);
-        $this->assertSame(5, $result['total']);
-        $this->assertSame([], $result['failed']);
+        $this->assertNull($result);
     }
 
-    public function testRunVendorCheckCommandReturnsResult(): void
+    public function testRunReturnsNullOnInvalidJsonOutput(): void
     {
-        $this->placeFakeBinary(
-            output: '{"present":10,"missing":["vendor/missing"],"incomplete":[],"total":11,"elapsed_ms":1}',
-        );
+        $this->placeFakeBinary(output: 'this is not valid json {{{');
 
         $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
-        $result = $bridge->run([
-            'command' => 'vendor-check',
-            'check_packages' => [
-                ['name' => 'vendor/pkg1', 'install_path' => '/tmp/vendor/pkg1'],
-            ],
-        ]);
+        $result = $bridge->run(['command' => 'test']);
 
-        $this->assertIsArray($result);
-        $this->assertSame(10, $result['present']);
-        $this->assertSame(11, $result['total']);
-        $this->assertSame(['vendor/missing'], $result['missing']);
-        $this->assertSame([], $result['incomplete']);
+        $this->assertNull($result);
     }
 
-    public function testRunVerifyCommandWithFailuresReturnsDetails(): void
+    public function testRunPassesPayloadToBinaryStdin(): void
     {
-        $this->placeFakeBinary(
-            output: '{"verified":1,"failed":[{"name":"vendor/bad","expected":"abc","actual":"def"}],"total":2,"elapsed_ms":5}',
-        );
+        // Fake binary that echoes back whatever it receives on stdin as a JSON wrapper
+        $this->placeFakeBinaryWithEcho();
 
         $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
-        $result = $bridge->run([
-            'command' => 'verify',
-            'verify_targets' => [],
-        ]);
+        $result = $bridge->run(['command' => 'classmap', 'project_dir' => '/test']);
 
         $this->assertIsArray($result);
-        $this->assertSame(1, $result['verified']);
-        $this->assertSame(2, $result['total']);
-        $this->assertCount(1, $result['failed']);
-        $this->assertSame('vendor/bad', $result['failed'][0]['name']);
+        $this->assertSame('classmap', $result['command']);
+        $this->assertSame('/test', $result['project_dir']);
     }
 
-    public function testRunVendorCheckWithIncompletePackages(): void
-    {
-        $this->placeFakeBinary(
-            output: '{"present":5,"missing":[],"incomplete":["vendor/empty"],"total":6,"elapsed_ms":2}',
-        );
-
-        $bridge = new RustBridge($this->composer, $this->io, $this->noFallbackDir);
-        $result = $bridge->run([
-            'command' => 'vendor-check',
-            'check_packages' => [],
-        ]);
-
-        $this->assertIsArray($result);
-        $this->assertSame(5, $result['present']);
-        $this->assertSame([], $result['missing']);
-        $this->assertSame(['vendor/empty'], $result['incomplete']);
-    }
-
+    /**
+     * Place a fake shell script at the expected binary path.
+     *
+     * The script responds to --version with the configured version,
+     * and otherwise consumes stdin then writes the configured output.
+     */
     private function placeFakeBinary(
         string $version = '0.1.0',
         string $output = '{"test":true,"stats":{}}',
@@ -231,6 +215,30 @@ class RustBridgeCommandTest extends TestCase
             cat > /dev/null
             printf '%s' '{$output}'
             exit {$exitCode}
+            BASH;
+
+        $binaryPath = $binDir . '/turbo-composer';
+        file_put_contents($binaryPath, $script);
+        chmod($binaryPath, 0o755);
+    }
+
+    /**
+     * Place a fake binary that reads stdin JSON and echoes it back as stdout.
+     */
+    private function placeFakeBinaryWithEcho(): void
+    {
+        $binDir = $this->tempDir . '/vendor/turbo-composer';
+        if (!is_dir($binDir)) {
+            mkdir($binDir, 0o755, true);
+        }
+
+        $script = <<<'BASH'
+            #!/bin/bash
+            if [ "$1" = "--version" ] || [ "$1" = "-V" ]; then
+                echo "turbo-composer 0.1.0"
+                exit 0
+            fi
+            cat
             BASH;
 
         $binaryPath = $binDir . '/turbo-composer';
