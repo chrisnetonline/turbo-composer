@@ -100,9 +100,7 @@ class CorrectnessTest extends TestCase
 
             // 3. Warm turbo run (parent::dump() should be skipped since
             //    ClassLoader.php and installed.php exist from the cold run)
-            $warmOutput = shell_exec(
-                "cd {$workDir} && composer dump-autoload --optimize --no-interaction 2>&1",
-            );
+            $warmOutput = shell_exec("cd {$workDir} && composer dump-autoload --optimize --no-interaction 2>&1");
             $this->assertNotNull($warmOutput, 'turbo warm dump-autoload failed');
             $this->assertTrue(
                 str_contains($warmOutput, 'turbo-composer') || str_contains($warmOutput, 'Rust'),
