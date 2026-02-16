@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace TurboComposer\Tests;
+namespace TurboComposer\Tests\Unit;
 
 use Composer\EventDispatcher\EventDispatcher;
 use Composer\Installer\InstallationManager;

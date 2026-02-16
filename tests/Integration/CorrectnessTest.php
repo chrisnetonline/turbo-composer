@@ -2,13 +2,15 @@
 
 declare(strict_types=1);
 
-namespace TurboComposer\Tests;
+namespace TurboComposer\Tests\Integration;
 
 use PHPUnit\Framework\TestCase;
 
+use function array_diff;
 use function array_diff_key;
 use function array_filter;
 use function array_keys;
+use function array_values;
 use function copy;
 use function count;
 use function file_exists;
@@ -17,16 +19,19 @@ use function file_put_contents;
 use function fwrite;
 use function implode;
 use function is_dir;
+use function json_decode;
 use function ksort;
 use function mkdir;
 use function preg_match_all;
 use function realpath;
 use function rmdir;
 use function shell_exec;
+use function sort;
 use function sprintf;
 use function str_contains;
 use function str_starts_with;
 use function sys_get_temp_dir;
+use function tempnam;
 use function uniqid;
 use function unlink;
 
@@ -39,7 +44,7 @@ class CorrectnessTest extends TestCase
 
     public static function setUpBeforeClass(): void
     {
-        self::$pluginDir = realpath(__DIR__ . '/..');
+        self::$pluginDir = realpath(__DIR__ . '/../..');
     }
 
     public function testSymfonyRealFixture(): void
@@ -68,9 +73,54 @@ class CorrectnessTest extends TestCase
 
         try {
             $this->composerInstall($workDir);
-            $vanillaClassmap = $this->generateVanillaClassmap($workDir);
-            $turboClassmap = $this->generateTurboClassmap($workDir);
-            $this->assertClassmapsMatch($vanillaClassmap, $turboClassmap, $fixtureName);
+
+            // 1. Generate vanilla Composer output as baseline
+            $vanilla = $this->generateVanillaAutoload($workDir);
+
+            // 2. Cold turbo run (parent::dump() runs alongside Rust)
+            $turbo = $this->generateTurboAutoload($workDir);
+
+            $this->assertClassmapsMatch($vanilla['classmap'], $turbo['classmap'], $fixtureName);
+            $this->assertAutoloadFilesMatch(
+                $vanilla['psr4'],
+                $turbo['psr4'],
+                $vanilla['namespaces'],
+                $turbo['namespaces'],
+                $fixtureName,
+                'cold',
+            );
+
+            // Fixture-aware class expectations: symfony-real maps App\ → src/, so
+            // the app/ dummy classes aren't autoloaded; use Src\ classes instead.
+            $expectedClasses = match ($fixtureName) {
+                'symfony-real' => ['Src\\TestClass1', 'Src\\TestClass30'],
+                default => ['App\\TestClass1', 'App\\TestClass50'],
+            };
+            $this->assertAutoloaderWorks($workDir, $fixtureName, 'cold', $expectedClasses);
+
+            // 3. Warm turbo run (parent::dump() should be skipped since
+            //    ClassLoader.php and installed.php exist from the cold run)
+            $warmOutput = shell_exec(
+                "cd {$workDir} && composer dump-autoload --optimize --no-interaction 2>&1",
+            );
+            $this->assertNotNull($warmOutput, 'turbo warm dump-autoload failed');
+            $this->assertTrue(
+                str_contains($warmOutput, 'turbo-composer') || str_contains($warmOutput, 'Rust'),
+                "turbo-composer didn't activate on warm run. Output:\n{$warmOutput}",
+            );
+
+            $warmTurbo = $this->collectAutoloadData($workDir);
+
+            $this->assertClassmapsMatch($vanilla['classmap'], $warmTurbo['classmap'], $fixtureName);
+            $this->assertAutoloadFilesMatch(
+                $vanilla['psr4'],
+                $warmTurbo['psr4'],
+                $vanilla['namespaces'],
+                $warmTurbo['namespaces'],
+                $fixtureName,
+                'warm',
+            );
+            $this->assertAutoloaderWorks($workDir, $fixtureName, 'warm', $expectedClasses);
         } finally {
             $this->removeDirectory($workDir);
         }
@@ -125,16 +175,24 @@ class CorrectnessTest extends TestCase
         );
     }
 
-    private function generateVanillaClassmap(string $workDir): array
+    /**
+     * @return array{classmap: array<string, string>, psr4: list<string>, namespaces: list<string>}
+     */
+    private function generateVanillaAutoload(string $workDir): array
     {
         shell_exec("cd {$workDir} && composer remove chrisnetonline/turbo-composer --no-interaction 2>&1");
 
         shell_exec("cd {$workDir} && composer dump-autoload --optimize --no-interaction 2>&1");
 
-        return $this->parseClassmapFile($workDir . '/vendor/composer/autoload_classmap.php');
+        return $this->collectAutoloadData($workDir);
     }
 
-    private function generateTurboClassmap(string $workDir): array
+    /**
+     * Install turbo-composer and run dump-autoload --optimize (cold run).
+     *
+     * @return array{classmap: array<string, string>, psr4: list<string>, namespaces: list<string>}
+     */
+    private function generateTurboAutoload(string $workDir): array
     {
         shell_exec(sprintf('cd %s && composer config repositories.turbo path %s 2>&1', $workDir, self::$pluginDir));
         shell_exec(
@@ -154,24 +212,48 @@ class CorrectnessTest extends TestCase
             "turbo-composer didn't activate. Output:\n{$output}",
         );
 
-        return $this->parseClassmapFile($workDir . '/vendor/composer/autoload_classmap.php');
+        return $this->collectAutoloadData($workDir);
     }
 
-    private function parseClassmapFile(string $path): array
+    /**
+     * Parse classmap, PSR-4 keys, and namespace keys from the generated autoload files.
+     *
+     * @return array{classmap: array<string, string>, psr4: list<string>, namespaces: list<string>}
+     */
+    private function collectAutoloadData(string $workDir): array
     {
-        $this->assertFileExists($path, "Classmap file not found: {$path}");
+        $composerDir = $workDir . '/vendor/composer';
 
-        $content = file_get_contents($path);
+        $classmapPath = $composerDir . '/autoload_classmap.php';
+        $this->assertFileExists($classmapPath, "Classmap file not found: {$classmapPath}");
+
         $classmap = [];
-
-        $pattern = "/^\s*'([^']+)'\s*=>\s*\\$\w+\s*\.\s*'([^']+)'/m";
-        preg_match_all($pattern, $content, $matches, PREG_SET_ORDER);
-
+        preg_match_all(
+            "/^\s*'([^']+)'\s*=>\s*\\$\w+\s*\.\s*'([^']+)'/m",
+            file_get_contents($classmapPath),
+            $matches,
+            PREG_SET_ORDER,
+        );
         foreach ($matches as $match) {
             $classmap[$match[1]] = $match[2];
         }
 
-        return $classmap;
+        $extractKeys = static function (string $path): array {
+            if (!file_exists($path)) {
+                return [];
+            }
+            preg_match_all("/^\s*'([^']+)'\s*=>/m", file_get_contents($path), $m);
+            $keys = $m[1];
+            sort($keys);
+
+            return $keys;
+        };
+
+        return [
+            'classmap' => $classmap,
+            'psr4' => $extractKeys($composerDir . '/autoload_psr4.php'),
+            'namespaces' => $extractKeys($composerDir . '/autoload_namespaces.php'),
+        ];
     }
 
     private function assertClassmapsMatch(array $vanilla, array $turbo, string $fixtureName): void
@@ -249,6 +331,112 @@ class CorrectnessTest extends TestCase
                 count($vanilla),
                 count($turbo),
             ));
+        }
+    }
+
+    /**
+     * Compare PSR-4 and PSR-0 namespace registrations between vanilla and turbo.
+     *
+     * @param list<string> $vanillaPsr4
+     * @param list<string> $turboPsr4
+     * @param list<string> $vanillaNamespaces
+     * @param list<string> $turboNamespaces
+     */
+    private function assertAutoloadFilesMatch(
+        array $vanillaPsr4,
+        array $turboPsr4,
+        array $vanillaNamespaces,
+        array $turboNamespaces,
+        string $fixtureName,
+        string $label,
+    ): void {
+        // Filter out TurboComposer's own namespace — it's only present in the turbo run
+        $filterTurbo = static fn(string $ns): bool => !str_starts_with($ns, 'TurboComposer\\');
+
+        $turboPsr4 = array_values(array_filter($turboPsr4, $filterTurbo));
+        $turboNamespaces = array_values(array_filter($turboNamespaces, $filterTurbo));
+
+        $missingPsr4 = array_diff($vanillaPsr4, $turboPsr4);
+        if ($missingPsr4 !== []) {
+            $this->fail(sprintf(
+                "[%s %s] PSR-4 namespaces in vanilla but missing from turbo:\n  %s",
+                $fixtureName,
+                $label,
+                implode("\n  ", $missingPsr4),
+            ));
+        }
+
+        $missingNamespaces = array_diff($vanillaNamespaces, $turboNamespaces);
+        if ($missingNamespaces !== []) {
+            $this->fail(sprintf(
+                "[%s %s] PSR-0 namespaces in vanilla but missing from turbo:\n  %s",
+                $fixtureName,
+                $label,
+                implode("\n  ", $missingNamespaces),
+            ));
+        }
+
+        $this->addToAssertionCount(1);
+    }
+
+    /**
+     * Run a PHP subprocess that requires the generated autoloader and verifies
+     * that it can actually resolve classes. This catches issues in autoload.php,
+     * autoload_real.php, autoload_static.php, and the classmap files.
+     *
+     * @param list<string> $expectedClasses FQCN of classes that must be resolvable
+     */
+    private function assertAutoloaderWorks(
+        string $workDir,
+        string $fixtureName,
+        string $label,
+        array $expectedClasses,
+    ): void {
+        $classChecks = '';
+        foreach ($expectedClasses as $i => $fqcn) {
+            $classChecks .= "    'class_{$i}' => class_exists('{$fqcn}', true),\n";
+        }
+
+        $script = <<<PHP
+            <?php
+            \$autoloadPath = \$argv[1] . '/vendor/autoload.php';
+            if (!file_exists(\$autoloadPath)) {
+                echo json_encode(['error' => 'autoload.php not found']);
+                exit(1);
+            }
+
+            \$loader = require \$autoloadPath;
+
+            \$results = [
+                'loader_valid' => (\$loader instanceof \\Composer\\Autoload\\ClassLoader),
+            {$classChecks}];
+
+            echo json_encode(\$results);
+            PHP;
+
+        $scriptPath = tempnam(sys_get_temp_dir(), 'turbo-autoload-test-');
+        file_put_contents($scriptPath, $script);
+
+        try {
+            $output = shell_exec(sprintf('php %s %s 2>&1', $scriptPath, $workDir));
+            $this->assertNotNull($output, "[{$fixtureName} {$label}] Autoload subprocess returned null");
+
+            $results = json_decode($output, true);
+            $this->assertIsArray($results, "[{$fixtureName} {$label}] Autoload output not valid JSON: {$output}");
+
+            $this->assertTrue(
+                $results['loader_valid'] ?? false,
+                "[{$fixtureName} {$label}] ClassLoader not returned from autoload.php",
+            );
+
+            foreach ($expectedClasses as $i => $fqcn) {
+                $this->assertTrue(
+                    $results["class_{$i}"] ?? false,
+                    "[{$fixtureName} {$label}] {$fqcn} not resolvable via autoloader",
+                );
+            }
+        } finally {
+            unlink($scriptPath);
         }
     }
 

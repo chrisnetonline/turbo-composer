@@ -18,18 +18,31 @@ use function array_key_exists;
 use function array_merge;
 use function file_exists;
 use function file_get_contents;
-use function file_put_contents;
 use function microtime;
 use function preg_match;
+use function rename;
 use function round;
 use function rtrim;
 use function str_starts_with;
+use function unlink;
 
 class TurboAutoloadGenerator extends AutoloadGenerator
 {
     private IOInterface $io;
     private RustBridge $bridge;
     private bool $turboDevMode = false;
+
+    private const STAGING_SUFFIX = '.turbo';
+
+    /** Files that Rust writes to the target dir (vendor/composer) */
+    private const STAGED_TARGET_FILES = [
+        'autoload_classmap.php',
+        'autoload_psr4.php',
+        'autoload_namespaces.php',
+        'autoload_files.php',
+        'autoload_static.php',
+        'autoload_real.php',
+    ];
 
     public function __construct(EventDispatcher $eventDispatcher, IOInterface $io, RustBridge $bridge)
     {
@@ -77,8 +90,6 @@ class TurboAutoloadGenerator extends AutoloadGenerator
         $totalStart = microtime(true);
         $this->io->write('<info>turbo-composer:</info> Rust-accelerated classmap generation…');
 
-        // Resolve the suffix early so we can start Rust before parent::dump.
-        // Mirrors Composer's own resolution: explicit param → config → existing autoload.php.
         $vendorDir = $config->get('vendor-dir');
         $resolvedSuffix = $suffix !== '' ? $suffix : null;
         $resolvedSuffix ??= $config->get('autoloader-suffix');
@@ -98,45 +109,57 @@ class TurboAutoloadGenerator extends AutoloadGenerator
         $absTargetDir = str_starts_with($targetDir, '/') ? $targetDir : $vendorDir . '/' . $targetDir;
         $payload = $this->buildPayload($projectDir, $vendorDir, $localRepo, $rootPackage, $installationManager);
         $payload['target_dir'] = $absTargetDir;
-        $payload['write_files'] = false; // PHP writes files after parent::dump to avoid race condition
+        $payload['staging_suffix'] = self::STAGING_SUFFIX;
+        $payload['has_platform_check'] = file_exists($absTargetDir . '/platform_check.php');
+        $payload['has_files_autoload'] = $payload['autoload']['files'] !== [];
+
         if ($resolvedSuffix !== null) {
             $payload['suffix'] = $resolvedSuffix;
         }
         $buildPayloadMs = round((microtime(true) - $t0) * 1000);
 
-        // Start Rust in the background, then run parent::dump while it works.
-        // When suffix was resolved early, both operations run in parallel.
+        // Decide whether we can skip parent::dump entirely.
+        // When Rust generates autoload.php + autoload_real.php (requires suffix),
+        // and the infrastructure files already exist from a previous dump,
+        // there's no need to run parent::dump at all.
+        $canSkipParentDump =
+            $resolvedSuffix !== null
+            && file_exists($absTargetDir . '/ClassLoader.php')
+            && file_exists($absTargetDir . '/installed.php');
+
+        // Start Rust in the background — it writes staged files directly to disk
         $collect = $this->bridge->startAsync($payload);
 
-        $t0 = microtime(true);
-        $result = parent::dump(
-            $config,
-            $localRepo,
-            $rootPackage,
-            $installationManager,
-            $targetDir,
-            false,
-            $suffix,
-            $locker,
-            $strictAmbiguous,
-        );
-        $parentDumpMs = round((microtime(true) - $t0) * 1000);
+        $parentDumpMs = 0.0;
+        $result = null;
+        if (!$canSkipParentDump) {
+            $t0 = microtime(true);
+            $result = parent::dump(
+                $config,
+                $localRepo,
+                $rootPackage,
+                $installationManager,
+                $targetDir,
+                false,
+                $suffix,
+                $locker,
+                $strictAmbiguous,
+            );
+            $parentDumpMs = round((microtime(true) - $t0) * 1000);
+        }
 
-        // Collect the Rust result (already finished or finishes shortly)
+        // Collect the Rust result (Rust writes files with .turbo suffix)
         $t0 = microtime(true);
         $rustResult = $collect !== null ? $collect() : null;
         $rustBridgeMs = round((microtime(true) - $t0) * 1000);
 
-        // If suffix wasn't available before parent::dump, Rust ran without it
-        // and the static file won't have been generated. Rare edge case (first
-        // ever install without a lock file).
+        // If suffix wasn't available before, Rust couldn't generate autoload_real.php
+        // or autoload_static.php. Rare edge case (first ever install without a lock file).
         if ($resolvedSuffix === null && $rustResult !== null) {
             $autoloadPhp = $vendorDir . '/autoload.php';
             if (file_exists($autoloadPhp)) {
                 $content = (string) file_get_contents($autoloadPhp);
                 if (preg_match('{ComposerAutoloaderInit([^:\s]+)::}', $content, $match)) {
-                    // Re-run Rust synchronously with the correct suffix.
-                    // This only happens on the very first install.
                     $payload['suffix'] = $match[1];
                     $rustResult = $this->bridge->run($payload);
                 }
@@ -144,6 +167,9 @@ class TurboAutoloadGenerator extends AutoloadGenerator
         }
 
         if ($rustResult === null) {
+            // Clean up any partially staged files
+            $this->cleanStagedFiles($absTargetDir, $vendorDir);
+
             $this->io->writeError('<warning>turbo-composer:</warning> Rust binary failed — '
             . 're-running with default Composer optimisation…');
             return parent::dump(
@@ -159,18 +185,19 @@ class TurboAutoloadGenerator extends AutoloadGenerator
             );
         }
 
-        // Write Rust-generated autoload files AFTER parent::dump to avoid race
-        // conditions. Rust returns file contents in JSON; we overwrite the non-
-        // optimised files that parent::dump produced with the Rust-optimised ones.
-        $this->writeRustFiles($absTargetDir, $rustResult);
+        // Promote staged files — atomic rename overwrites parent::dump's versions
+        $this->promoteStagedFiles($absTargetDir, $vendorDir);
 
         $totalMs = round((microtime(true) - $totalStart) * 1000);
         $count = $rustResult['classmap_count'] ?? 0;
         $stats = $rustResult['stats'] ?? [];
         $walkSkipped = $stats['walk_skipped'] ?? false ? ' (walk skipped)' : '';
-        $parallel = $resolvedSuffix !== null ? ' [parallel]' : '';
+        $skippedLabel = $canSkipParentDump ? ' [skipped]' : '';
+        $parallel = !$canSkipParentDump && $resolvedSuffix !== null ? ' [parallel]' : '';
         $this->io->write("<info>turbo-composer:</info> ✓ {$count} classes mapped in {$totalMs}ms");
-        $this->io->write("<info>turbo-composer:</info>   ├─ parent::dump (base):     {$parentDumpMs}ms{$parallel}");
+        $this->io->write(
+            "<info>turbo-composer:</info>   ├─ parent::dump (base):     {$parentDumpMs}ms{$parallel}{$skippedLabel}",
+        );
         $this->io->write("<info>turbo-composer:</info>   ├─ buildPayload (PHP):      {$buildPayloadMs}ms");
         $this->io->write("<info>turbo-composer:</info>   ├─ Rust bridge (collect):   {$rustBridgeMs}ms");
         $this->io->write(
@@ -185,22 +212,41 @@ class TurboAutoloadGenerator extends AutoloadGenerator
         return $result;
     }
 
-    private function writeRustFiles(string $targetDir, array $rustResult): void
+    /**
+     * Rename staged files (.turbo suffix) to their final names.
+     * This is atomic on POSIX systems (same filesystem).
+     */
+    private function promoteStagedFiles(string $targetDir, string $vendorDir): void
     {
-        $files = [
-            'autoload_classmap.php' => $rustResult['classmap_file_content'] ?? '',
-            'autoload_psr4.php' => $rustResult['psr4_file_content'] ?? '',
-            'autoload_namespaces.php' => $rustResult['namespaces_file_content'] ?? '',
-            'autoload_files.php' => $rustResult['files_file_content'] ?? '',
-            'autoload_static.php' => $rustResult['static_file_content'] ?? '',
-        ];
-
-        foreach ($files as $name => $content) {
-            if ($content === '') {
-                continue;
+        foreach (self::STAGED_TARGET_FILES as $file) {
+            $staged = $targetDir . '/' . $file . self::STAGING_SUFFIX;
+            if (file_exists($staged)) {
+                rename($staged, $targetDir . '/' . $file);
             }
+        }
 
-            file_put_contents($targetDir . '/' . $name, $content);
+        // autoload.php lives in vendor root, not vendor/composer
+        $staged = $vendorDir . '/autoload.php' . self::STAGING_SUFFIX;
+        if (file_exists($staged)) {
+            rename($staged, $vendorDir . '/autoload.php');
+        }
+    }
+
+    /**
+     * Clean up staged files on failure.
+     */
+    private function cleanStagedFiles(string $targetDir, string $vendorDir): void
+    {
+        foreach (self::STAGED_TARGET_FILES as $file) {
+            $staged = $targetDir . '/' . $file . self::STAGING_SUFFIX;
+            if (file_exists($staged)) {
+                unlink($staged);
+            }
+        }
+
+        $staged = $vendorDir . '/autoload.php' . self::STAGING_SUFFIX;
+        if (file_exists($staged)) {
+            unlink($staged);
         }
     }
 

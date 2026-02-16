@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 
 use cache::{load_cache, save_cache, CacheData};
 use codegen::{
-    generate_classmap_file, generate_files_file, generate_namespaces_file, generate_psr4_file,
-    generate_static_file,
+    generate_autoload_php, generate_autoload_real_php, generate_classmap_file,
+    generate_files_file, generate_namespaces_file, generate_psr4_file, generate_static_file,
 };
 use walker::walk_and_parse;
 
@@ -40,14 +40,32 @@ pub struct FileAutoload {
     pub path: String,
 }
 
+pub struct ClassmapConfig {
+    pub project_dir: String,
+    pub vendor_dir: String,
+    pub autoload: AutoloadMappings,
+    pub exclude_from_classmap: Vec<String>,
+    pub target_dir: Option<String>,
+    pub suffix: Option<String>,
+    pub write_files: bool,
+    pub staging_suffix: Option<String>,
+    pub has_platform_check: bool,
+    pub has_files_autoload: bool,
+}
+
 #[derive(Debug, Serialize)]
 struct Output {
     classmap_count: usize,
-    classmap_file_content: String,
-    static_file_content: String,
-    psr4_file_content: String,
-    namespaces_file_content: String,
-    files_file_content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    classmap_file_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    static_file_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    psr4_file_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    namespaces_file_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    files_file_content: Option<String>,
     files_written: bool,
     stats: Stats,
 }
@@ -65,18 +83,11 @@ struct Stats {
     generate_ms: u128,
 }
 
-pub fn run(
-    project_dir: String,
-    vendor_dir: String,
-    autoload: AutoloadMappings,
-    exclude_from_classmap: Vec<String>,
-    target_dir: Option<String>,
-    suffix: Option<String>,
-    write_files: bool,
-) -> serde_json::Value {
+pub fn run(config: ClassmapConfig) -> serde_json::Value {
     let start = std::time::Instant::now();
 
-    let excludes: Vec<Regex> = exclude_from_classmap
+    let excludes: Vec<Regex> = config
+        .exclude_from_classmap
         .iter()
         .filter_map(|p| {
             let re = p.replace('/', r"[/\\]").replace('*', ".*");
@@ -85,12 +96,13 @@ pub fn run(
         .collect();
 
     // Skip fs::canonicalize syscall for absolute paths without ".." components
-    let all_dirs: Vec<String> = autoload
+    let all_dirs: Vec<String> = config
+        .autoload
         .psr4
         .iter()
         .map(|m| m.path.as_str())
-        .chain(autoload.psr0.iter().map(|m| m.path.as_str()))
-        .chain(autoload.classmap.iter().map(String::as_str))
+        .chain(config.autoload.psr0.iter().map(|m| m.path.as_str()))
+        .chain(config.autoload.classmap.iter().map(String::as_str))
         .map(|d| {
             if Path::new(d).is_absolute() && !d.contains("..") {
                 d.to_string()
@@ -104,7 +116,8 @@ pub fn run(
 
     let dir_refs: Vec<&str> = all_dirs.iter().map(String::as_str).collect();
 
-    let cache_path = target_dir
+    let cache_path = config
+        .target_dir
         .as_ref()
         .map(|td| Path::new(td).join(".turbo-cache"));
     let cache: CacheData = cache_path
@@ -112,7 +125,8 @@ pub fn run(
         .map(|p| load_cache(p))
         .unwrap_or_default();
 
-    let vendor_real = fs::canonicalize(&vendor_dir).unwrap_or_else(|_| PathBuf::from(&vendor_dir));
+    let vendor_real =
+        fs::canonicalize(&config.vendor_dir).unwrap_or_else(|_| PathBuf::from(&config.vendor_dir));
     let vendor_str = vendor_real.to_string_lossy().to_string();
 
     let walk_parse_start = std::time::Instant::now();
@@ -132,16 +146,18 @@ pub fn run(
     let gen_start = std::time::Instant::now();
     let classmap_count = classmap.len();
 
-    let base_real = fs::canonicalize(&project_dir).unwrap_or_else(|_| PathBuf::from(&project_dir));
+    let base_real =
+        fs::canonicalize(&config.project_dir).unwrap_or_else(|_| PathBuf::from(&config.project_dir));
     let base_str = base_real.to_string_lossy().to_string();
 
     let classmap_file_content = generate_classmap_file(&classmap, &vendor_str, &base_str);
-    let psr4_file_content = generate_psr4_file(&autoload.psr4, &vendor_str, &base_str);
-    let namespaces_file_content = generate_namespaces_file(&autoload.psr0, &vendor_str, &base_str);
-    let files_file_content = generate_files_file(&autoload.files, &vendor_str, &base_str);
+    let psr4_file_content = generate_psr4_file(&config.autoload.psr4, &vendor_str, &base_str);
+    let namespaces_file_content =
+        generate_namespaces_file(&config.autoload.psr0, &vendor_str, &base_str);
+    let files_file_content = generate_files_file(&config.autoload.files, &vendor_str, &base_str);
 
-    let static_file_content = if let Some(ref sfx) = suffix {
-        let td = target_dir.as_deref().unwrap_or("");
+    let static_file_content = if let Some(ref sfx) = config.suffix {
+        let td = config.target_dir.as_deref().unwrap_or("");
         let td_real = if !td.is_empty() {
             fs::canonicalize(td)
                 .unwrap_or_else(|_| PathBuf::from(td))
@@ -152,10 +168,10 @@ pub fn run(
         };
         generate_static_file(
             sfx,
-            &autoload.psr4,
-            &autoload.psr0,
+            &config.autoload.psr4,
+            &config.autoload.psr0,
             &classmap,
-            &autoload.files,
+            &config.autoload.files,
             &vendor_str,
             &base_str,
             &td_real,
@@ -164,28 +180,67 @@ pub fn run(
         String::new()
     };
 
+    // Generate autoload.php and autoload_real.php when we have a suffix
+    let autoload_php_content = config
+        .suffix
+        .as_ref()
+        .map(|sfx| generate_autoload_php(sfx));
+    let autoload_real_php_content = config.suffix.as_ref().map(|sfx| {
+        generate_autoload_real_php(sfx, config.has_platform_check, config.has_files_autoload)
+    });
+
     let generate_ms = gen_start.elapsed().as_millis();
 
-    let files_written = if write_files {
-        if let Some(ref td) = target_dir {
+    // Determine whether we write files directly or return contents via JSON.
+    // With staging_suffix, files are written with a suffix appended (e.g. ".turbo")
+    // so PHP can atomically rename them after parent::dump completes.
+    let use_staging = config.staging_suffix.is_some();
+    let suffix_ext = config.staging_suffix.as_deref().unwrap_or("");
+
+    let files_written = if config.write_files || use_staging {
+        if let Some(ref td) = config.target_dir {
             let td_path = Path::new(td);
+            let vendor_path = Path::new(&config.vendor_dir);
             let write_result = (|| -> Result<(), std::io::Error> {
                 fs::write(
-                    td_path.join("autoload_classmap.php"),
+                    td_path.join(format!("autoload_classmap.php{suffix_ext}")),
                     &classmap_file_content,
                 )?;
-                fs::write(td_path.join("autoload_psr4.php"), &psr4_file_content)?;
                 fs::write(
-                    td_path.join("autoload_namespaces.php"),
+                    td_path.join(format!("autoload_psr4.php{suffix_ext}")),
+                    &psr4_file_content,
+                )?;
+                fs::write(
+                    td_path.join(format!("autoload_namespaces.php{suffix_ext}")),
                     &namespaces_file_content,
                 )?;
 
                 if !files_file_content.is_empty() {
-                    fs::write(td_path.join("autoload_files.php"), &files_file_content)?;
+                    fs::write(
+                        td_path.join(format!("autoload_files.php{suffix_ext}")),
+                        &files_file_content,
+                    )?;
                 }
 
                 if !static_file_content.is_empty() {
-                    fs::write(td_path.join("autoload_static.php"), &static_file_content)?;
+                    fs::write(
+                        td_path.join(format!("autoload_static.php{suffix_ext}")),
+                        &static_file_content,
+                    )?;
+                }
+
+                // Write autoload infrastructure files when suffix is available
+                if let Some(ref content) = autoload_php_content {
+                    fs::write(
+                        vendor_path.join(format!("autoload.php{suffix_ext}")),
+                        content,
+                    )?;
+                }
+                if let Some(ref content) = autoload_real_php_content {
+                    fs::write(
+                        td_path.join(format!("autoload_real.php{suffix_ext}")),
+                        content,
+                    )?;
                 }
 
                 Ok(())
@@ -208,13 +263,36 @@ pub fn run(
         save_cache(cp, &walk_result.new_cache);
     }
 
+    // When staging, skip returning file contents — they're already on disk.
+    let include_contents = !use_staging;
+
     let output = Output {
         classmap_count,
-        classmap_file_content,
-        static_file_content,
-        psr4_file_content,
-        namespaces_file_content,
-        files_file_content,
+        classmap_file_content: if include_contents {
+            Some(classmap_file_content)
+        } else {
+            None
+        },
+        static_file_content: if include_contents {
+            Some(static_file_content)
+        } else {
+            None
+        },
+        psr4_file_content: if include_contents {
+            Some(psr4_file_content)
+        } else {
+            None
+        },
+        namespaces_file_content: if include_contents {
+            Some(namespaces_file_content)
+        } else {
+            None
+        },
+        files_file_content: if include_contents {
+            Some(files_file_content)
+        } else {
+            None
+        },
         files_written,
         stats: Stats {
             files_scanned: walk_result.files_scanned,
@@ -238,6 +316,29 @@ mod tests {
     use cache::CACHE_VERSION;
     use std::io::Write;
     use tempfile::TempDir;
+
+    fn test_config(
+        project_dir: String,
+        vendor_dir: String,
+        autoload: AutoloadMappings,
+        exclude_from_classmap: Vec<String>,
+        target_dir: Option<String>,
+        suffix: Option<String>,
+        write_files: bool,
+    ) -> ClassmapConfig {
+        ClassmapConfig {
+            project_dir,
+            vendor_dir,
+            autoload,
+            exclude_from_classmap,
+            target_dir,
+            suffix,
+            write_files,
+            staging_suffix: None,
+            has_platform_check: false,
+            has_files_autoload: false,
+        }
+    }
 
     #[test]
     fn run_with_real_files() {
@@ -264,7 +365,7 @@ mod tests {
             files: vec![],
         };
 
-        let result = run(
+        let result = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload,
@@ -272,7 +373,7 @@ mod tests {
             None,
             None,
             true,
-        );
+        ));
 
         assert_eq!(result["classmap_count"].as_u64().unwrap(), 2);
         let content = result["classmap_file_content"].as_str().unwrap();
@@ -303,7 +404,7 @@ mod tests {
             files: vec![],
         };
 
-        let result = run(
+        let result = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload,
@@ -311,7 +412,7 @@ mod tests {
             None,
             None,
             true,
-        );
+        ));
 
         let content = result["classmap_file_content"].as_str().unwrap();
         assert!(content.contains("App\\\\Main"));
@@ -334,7 +435,7 @@ mod tests {
             files: vec![],
         };
 
-        let result = run(
+        let result = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload,
@@ -342,7 +443,7 @@ mod tests {
             None,
             None,
             true,
-        );
+        ));
 
         assert_eq!(result["classmap_count"].as_u64().unwrap(), 0);
     }
@@ -359,7 +460,7 @@ mod tests {
             files: vec![],
         };
 
-        let result = run(
+        let result = run(test_config(
             "/tmp".to_string(),
             "/tmp/vendor".to_string(),
             autoload,
@@ -367,7 +468,7 @@ mod tests {
             None,
             None,
             true,
-        );
+        ));
 
         assert_eq!(result["classmap_count"].as_u64().unwrap(), 0);
     }
@@ -395,8 +496,7 @@ mod tests {
             files: vec![],
         };
 
-        // Cold run: full walk
-        let result1 = run(
+        let result1 = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload.clone(),
@@ -404,12 +504,11 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
         assert_eq!(result1["classmap_count"].as_u64().unwrap(), 2);
         assert!(!result1["stats"]["walk_skipped"].as_bool().unwrap());
 
-        // Warm run: should skip walk, use cached file list
-        let result2 = run(
+        let result2 = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload.clone(),
@@ -417,7 +516,7 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
         assert_eq!(result2["classmap_count"].as_u64().unwrap(), 2);
         assert!(result2["stats"]["walk_skipped"].as_bool().unwrap());
         assert_eq!(result2["stats"]["directories_walked"].as_u64().unwrap(), 0);
@@ -444,8 +543,7 @@ mod tests {
             files: vec![],
         };
 
-        // Cold run
-        let result1 = run(
+        let result1 = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload.clone(),
@@ -453,17 +551,14 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
         assert_eq!(result1["classmap_count"].as_u64().unwrap(), 1);
 
-        // Add a new file (changes directory mtime)
-        // Sleep 1s+ to ensure mtime differs (get_mtime uses second resolution)
         std::thread::sleep(std::time::Duration::from_secs(1));
         let mut f2 = fs::File::create(src_dir.join("Bar.php")).unwrap();
         writeln!(f2, "<?php\nnamespace App;\nclass Bar {{}}").unwrap();
 
-        // Next run: should detect dir change and do full walk
-        let result2 = run(
+        let result2 = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload.clone(),
@@ -471,7 +566,7 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
         assert_eq!(result2["classmap_count"].as_u64().unwrap(), 2);
         assert!(!result2["stats"]["walk_skipped"].as_bool().unwrap());
     }
@@ -497,8 +592,7 @@ mod tests {
             files: vec![],
         };
 
-        // Cold run
-        let result1 = run(
+        let result1 = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload.clone(),
@@ -506,13 +600,10 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
         assert_eq!(result1["classmap_count"].as_u64().unwrap(), 1);
-        let content1 = result1["stats"]["cache_hits"].as_u64().unwrap();
-        assert_eq!(content1, 0);
+        assert_eq!(result1["stats"]["cache_hits"].as_u64().unwrap(), 0);
 
-        // Modify file content (add a new class) — note: dir mtime doesn't change
-        // since we're writing to an existing file, so the walk CAN be skipped
         std::thread::sleep(std::time::Duration::from_secs(1));
         fs::write(
             &foo_path,
@@ -520,9 +611,7 @@ mod tests {
         )
         .unwrap();
 
-        // Next run: walk may be skipped (dir unchanged), but file mtime changed
-        // so the file is re-parsed
-        let result2 = run(
+        let result2 = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload,
@@ -530,7 +619,7 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
         assert_eq!(result2["classmap_count"].as_u64().unwrap(), 2);
     }
 
@@ -558,7 +647,7 @@ mod tests {
             files: vec![],
         };
 
-        let _ = run(
+        let _ = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload,
@@ -566,9 +655,8 @@ mod tests {
             Some(target_dir.to_string_lossy().to_string()),
             None,
             true,
-        );
+        ));
 
-        // Verify cache file contains v2 format with dir_mtimes
         let cache_path = target_dir.join(".turbo-cache");
         assert!(cache_path.exists());
         let data: serde_json::Value =
@@ -577,5 +665,65 @@ mod tests {
         assert!(data["files"].is_object());
         assert!(data["dir_mtimes"].is_object());
         assert!(!data["dir_mtimes"].as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn staging_suffix_writes_with_suffix_and_omits_contents() {
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("src");
+        let target_dir = tmp.path().join("composer");
+        let vendor_dir = tmp.path().join("vendor");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::create_dir_all(&vendor_dir).unwrap();
+
+        fs::write(
+            src_dir.join("Foo.php"),
+            "<?php\nnamespace App;\nclass Foo {}\n",
+        )
+        .unwrap();
+
+        let result = run(ClassmapConfig {
+            project_dir: tmp.path().to_string_lossy().to_string(),
+            vendor_dir: vendor_dir.to_string_lossy().to_string(),
+            autoload: AutoloadMappings {
+                psr4: vec![NamespaceMapping {
+                    namespace: "App\\".to_string(),
+                    path: src_dir.to_string_lossy().to_string(),
+                }],
+                psr0: vec![],
+                classmap: vec![],
+                files: vec![],
+            },
+            exclude_from_classmap: vec![],
+            target_dir: Some(target_dir.to_string_lossy().to_string()),
+            suffix: Some("test123".to_string()),
+            write_files: false,
+            staging_suffix: Some(".turbo".to_string()),
+            has_platform_check: true,
+            has_files_autoload: false,
+        });
+
+        // File contents should NOT be in the JSON response
+        assert!(result.get("classmap_file_content").is_none());
+        assert!(result.get("static_file_content").is_none());
+        assert!(result["files_written"].as_bool().unwrap());
+        assert_eq!(result["classmap_count"].as_u64().unwrap(), 1);
+
+        // Staged files should exist on disk
+        assert!(target_dir.join("autoload_classmap.php.turbo").exists());
+        assert!(target_dir.join("autoload_psr4.php.turbo").exists());
+        assert!(target_dir.join("autoload_static.php.turbo").exists());
+        assert!(target_dir.join("autoload_real.php.turbo").exists());
+        assert!(vendor_dir.join("autoload.php.turbo").exists());
+
+        // Verify autoload.php content
+        let autoload_content = fs::read_to_string(vendor_dir.join("autoload.php.turbo")).unwrap();
+        assert!(autoload_content.contains("ComposerAutoloaderInittest123"));
+
+        // Verify autoload_real.php content
+        let real_content = fs::read_to_string(target_dir.join("autoload_real.php.turbo")).unwrap();
+        assert!(real_content.contains("ComposerAutoloaderInittest123"));
+        assert!(real_content.contains("platform_check.php"));
     }
 }
