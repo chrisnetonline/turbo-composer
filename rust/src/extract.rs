@@ -125,6 +125,30 @@ fn extract_zip(
         file_entries.push((relative, i));
     }
 
+    // Deduplicate: if a zip contains the same relative path more than once,
+    // keep only the last entry (last-wins, matching sequential extraction semantics).
+    // This prevents parallel threads from racing to write the same output path.
+    {
+        let mut seen = std::collections::HashMap::with_capacity(file_entries.len());
+        for (i, (rel, _)) in file_entries.iter().enumerate() {
+            seen.insert(rel.clone(), i);
+        }
+        if seen.len() < file_entries.len() {
+            let mut keep: Vec<bool> = vec![false; file_entries.len()];
+            for &idx in seen.values() {
+                keep[idx] = true;
+            }
+            let mut write = 0;
+            for read in 0..file_entries.len() {
+                if keep[read] {
+                    file_entries.swap(write, read);
+                    write += 1;
+                }
+            }
+            file_entries.truncate(write);
+        }
+    }
+
     dirs_to_create.sort();
     dirs_to_create.dedup();
     for dir in &dirs_to_create {
@@ -369,6 +393,70 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dest_dir.join("README.md")).unwrap(),
             "# Hello"
+        );
+    }
+
+    /// Create a zip with duplicate filenames by merging two archives.
+    /// The zip crate's writer rejects duplicates, but `merge_archive`
+    /// copies entries verbatim, allowing the same name to appear twice.
+    fn create_zip_with_duplicate_entries(dir: &Path, name: &str) -> String {
+        let zip_path = dir.join(name);
+
+        // First archive: config.txt with "first version"
+        let buf1 = std::io::Cursor::new(Vec::new());
+        let mut zip1 = zip::ZipWriter::new(buf1);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        zip1.start_file("config.txt", options).unwrap();
+        zip1.write_all(b"first version").unwrap();
+        zip1.start_file("other.txt", options).unwrap();
+        zip1.write_all(b"other file").unwrap();
+        let archive1 = zip::ZipArchive::new(zip1.finish().unwrap()).unwrap();
+
+        // Second archive: config.txt with "second version"
+        let buf2 = std::io::Cursor::new(Vec::new());
+        let mut zip2 = zip::ZipWriter::new(buf2);
+        zip2.start_file("config.txt", options).unwrap();
+        zip2.write_all(b"second version").unwrap();
+        let archive2 = zip::ZipArchive::new(zip2.finish().unwrap()).unwrap();
+
+        // Merge both into a single zip — config.txt appears at index 0 and index 2
+        let file = fs::File::create(&zip_path).unwrap();
+        let mut merged = zip::ZipWriter::new(file);
+        merged.merge_archive(archive1).unwrap();
+        merged.merge_archive(archive2).unwrap();
+        merged.finish().unwrap();
+
+        zip_path.to_string_lossy().to_string()
+    }
+
+    #[test]
+    fn extract_zip_duplicate_entries_last_wins() {
+        let tmp = TempDir::new().unwrap();
+        let archives_dir = tmp.path().join("archives");
+        fs::create_dir_all(&archives_dir).unwrap();
+        let dest_dir = tmp.path().join("output");
+
+        let zip_path = create_zip_with_duplicate_entries(&archives_dir, "dupes.zip");
+
+        let packages = vec![PackageExtraction {
+            zip: zip_path,
+            dest: dest_dir.to_string_lossy().to_string(),
+            name: "test/dupe-pkg".to_string(),
+        }];
+
+        let result = run(packages);
+        assert_eq!(result["extracted"].as_u64().unwrap(), 1);
+        assert!(result["failed"].as_array().unwrap().is_empty());
+
+        // Last entry for "config.txt" should win (last-wins semantics)
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("config.txt")).unwrap(),
+            "second version"
+        );
+        assert_eq!(
+            fs::read_to_string(dest_dir.join("other.txt")).unwrap(),
+            "other file"
         );
     }
 
