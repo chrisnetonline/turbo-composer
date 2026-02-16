@@ -68,11 +68,7 @@ fn extract_one(
     }
     fs::create_dir_all(dest)?;
 
-    match zip_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-    {
+    match zip_path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "zip" => extract_zip(zip_path, dest, total_files),
         "gz" | "tgz" => extract_tar_gz(zip_path, dest, total_files),
         "tar" => extract_tar(zip_path, dest, total_files),
@@ -95,7 +91,7 @@ fn extract_zip(
 
     let strip = detect_strip_prefix(&mut archive);
 
-    let mut file_entries: Vec<String> = Vec::with_capacity(count);
+    let mut file_entries: Vec<(String, usize)> = Vec::with_capacity(count);
     let mut dirs_to_create: Vec<String> = Vec::new();
 
     for i in 0..count {
@@ -126,7 +122,7 @@ fn extract_zip(
             }
         }
 
-        file_entries.push(relative);
+        file_entries.push((relative, i));
     }
 
     dirs_to_create.sort();
@@ -137,41 +133,42 @@ fn extract_zip(
 
     let mmap_ref: &[u8] = &mmap;
 
-    file_entries.par_iter().try_for_each(|relative| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let out_path = dest.join(relative);
+    let num_threads = rayon::current_num_threads().max(1);
+    let chunk_size = file_entries.len().div_ceil(num_threads).max(1);
 
-        if let Some(parent) = out_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+    file_entries.par_chunks(chunk_size).try_for_each(
+        |chunk| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let cursor = Cursor::new(mmap_ref);
+            let mut arch = zip::ZipArchive::new(cursor)?;
 
-        let full_name = match &strip {
-            Some(prefix) => format!("{prefix}{relative}"),
-            None => relative.clone(),
-        };
+            for (relative, idx) in chunk {
+                let out_path = dest.join(relative);
 
-        let cursor = Cursor::new(mmap_ref);
-        let mut arch = zip::ZipArchive::new(cursor)?;
-        let mut zip_entry = arch.by_name(&full_name)?;
-        let mut outfile = fs::File::create(&out_path)?;
-        std::io::copy(&mut zip_entry, &mut outfile)?;
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = zip_entry.unix_mode() {
-                fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
+                let mut zip_entry = arch.by_index(*idx)?;
+                let mut outfile = fs::File::create(&out_path)?;
+                std::io::copy(&mut zip_entry, &mut outfile)?;
+
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Some(mode) = zip_entry.unix_mode() {
+                        fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
+                    }
+                }
             }
-        }
 
-        Ok(())
-    })?;
+            Ok(())
+        },
+    )?;
 
     Ok(())
 }
 
-fn detect_strip_prefix(
-    archive: &mut zip::ZipArchive<Cursor<&[u8]>>,
-) -> Option<String> {
+fn detect_strip_prefix(archive: &mut zip::ZipArchive<Cursor<&[u8]>>) -> Option<String> {
     let mut common: Option<String> = None;
 
     for i in 0..archive.len() {
@@ -421,11 +418,7 @@ mod tests {
         let tar_gz_path = create_test_tar_gz(
             &archives_dir,
             "test.tar.gz",
-            &[
-                ("a.txt", b"aaa"),
-                ("b.txt", b"bbb"),
-                ("c/d.txt", b"ccc"),
-            ],
+            &[("a.txt", b"aaa"), ("b.txt", b"bbb"), ("c/d.txt", b"ccc")],
         );
 
         let packages = vec![PackageExtraction {
@@ -440,10 +433,7 @@ mod tests {
 
         assert_eq!(fs::read_to_string(dest_dir.join("a.txt")).unwrap(), "aaa");
         assert_eq!(fs::read_to_string(dest_dir.join("b.txt")).unwrap(), "bbb");
-        assert_eq!(
-            fs::read_to_string(dest_dir.join("c/d.txt")).unwrap(),
-            "ccc"
-        );
+        assert_eq!(fs::read_to_string(dest_dir.join("c/d.txt")).unwrap(), "ccc");
     }
 
     #[test]
@@ -589,10 +579,7 @@ mod tests {
         let good_zip = create_test_zip(
             &archives_dir,
             "good.zip",
-            &[
-                ("file.txt", b"good content"),
-                ("readme.md", b"# Hello"),
-            ],
+            &[("file.txt", b"good content"), ("readme.md", b"# Hello")],
         );
 
         let good_dest = tmp.path().join("good_out");

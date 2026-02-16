@@ -1,13 +1,78 @@
 /// PHP reserved keywords that cannot be class/interface/trait/enum names.
 const PHP_KEYWORDS: &[&str] = &[
-    "abstract", "and", "array", "as", "break", "callable", "case", "catch", "class", "clone",
-    "const", "continue", "declare", "default", "do", "echo", "else", "elseif", "empty",
-    "enddeclare", "endfor", "endforeach", "endif", "endswitch", "endwhile", "enum", "eval",
-    "exit", "extends", "false", "final", "finally", "fn", "for", "foreach", "function", "global",
-    "goto", "if", "implements", "include", "include_once", "instanceof", "insteadof", "interface",
-    "isset", "list", "match", "namespace", "new", "null", "or", "print", "private", "protected",
-    "public", "readonly", "require", "require_once", "return", "self", "static", "switch",
-    "throw", "trait", "true", "try", "unset", "use", "var", "while", "xor", "yield",
+    "abstract",
+    "and",
+    "array",
+    "as",
+    "break",
+    "callable",
+    "case",
+    "catch",
+    "class",
+    "clone",
+    "const",
+    "continue",
+    "declare",
+    "default",
+    "do",
+    "echo",
+    "else",
+    "elseif",
+    "empty",
+    "enddeclare",
+    "endfor",
+    "endforeach",
+    "endif",
+    "endswitch",
+    "endwhile",
+    "enum",
+    "eval",
+    "exit",
+    "extends",
+    "false",
+    "final",
+    "finally",
+    "fn",
+    "for",
+    "foreach",
+    "function",
+    "global",
+    "goto",
+    "if",
+    "implements",
+    "include",
+    "include_once",
+    "instanceof",
+    "insteadof",
+    "interface",
+    "isset",
+    "list",
+    "match",
+    "namespace",
+    "new",
+    "null",
+    "or",
+    "print",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "require",
+    "require_once",
+    "return",
+    "self",
+    "static",
+    "switch",
+    "throw",
+    "trait",
+    "true",
+    "try",
+    "unset",
+    "use",
+    "var",
+    "while",
+    "xor",
+    "yield",
 ];
 
 pub(crate) fn extract_php_symbols(contents: &str) -> Vec<String> {
@@ -99,8 +164,7 @@ pub(crate) fn extract_php_symbols(contents: &str) -> Vec<String> {
             }
             b'<' if pos + 2 < len && bytes[pos + 1] == b'<' && bytes[pos + 2] == b'<' => {
                 pos += 3;
-                while pos < len
-                    && (bytes[pos] == b' ' || bytes[pos] == b'\'' || bytes[pos] == b'"')
+                while pos < len && (bytes[pos] == b' ' || bytes[pos] == b'\'' || bytes[pos] == b'"')
                 {
                     pos += 1;
                 }
@@ -183,9 +247,7 @@ pub(crate) fn extract_php_symbols(contents: &str) -> Vec<String> {
                         if !prev_was_new && !after_double_colon {
                             skip_whitespace(bytes, &mut pos);
                             let name = read_identifier(bytes, &mut pos);
-                            if !name.is_empty()
-                                && !PHP_KEYWORDS.contains(&name.as_str())
-                            {
+                            if !name.is_empty() && !PHP_KEYWORDS.contains(&name.as_str()) {
                                 let fqcn = match &namespace {
                                     Some(ns) => format!("{ns}\\{name}"),
                                     None => name,
@@ -232,13 +294,13 @@ pub(crate) fn extract_php_symbols(contents: &str) -> Vec<String> {
 
 #[inline]
 pub(crate) fn contains_class_keyword(bytes: &[u8]) -> bool {
-    fn find_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack.windows(needle.len()).any(|w| w == needle)
-    }
-    find_subsequence(bytes, b"class")
-        || find_subsequence(bytes, b"interface")
-        || find_subsequence(bytes, b"trait")
-        || find_subsequence(bytes, b"enum")
+    use aho_corasick::AhoCorasick;
+    use std::sync::LazyLock;
+
+    static AC: LazyLock<AhoCorasick> =
+        LazyLock::new(|| AhoCorasick::new(["class", "interface", "trait", "enum"]).unwrap());
+
+    AC.is_match(bytes)
 }
 
 #[inline]
@@ -310,9 +372,8 @@ mod tests {
 
     #[test]
     fn extract_multiple_classes_same_namespace() {
-        let symbols = extract_php_symbols(
-            "<?php\nnamespace App\\Models;\n\nclass User {}\nclass Post {}\n",
-        );
+        let symbols =
+            extract_php_symbols("<?php\nnamespace App\\Models;\n\nclass User {}\nclass Post {}\n");
         assert_eq!(symbols, vec!["App\\Models\\User", "App\\Models\\Post"]);
     }
 
@@ -383,9 +444,8 @@ mod tests {
 
     #[test]
     fn ignores_double_colon_class_constant() {
-        let symbols = extract_php_symbols(
-            "<?php\nnamespace App;\nclass Foo {}\n$x = Foo::class;\n",
-        );
+        let symbols =
+            extract_php_symbols("<?php\nnamespace App;\nclass Foo {}\n$x = Foo::class;\n");
         assert_eq!(symbols, vec!["App\\Foo"]);
     }
 
@@ -401,9 +461,8 @@ mod tests {
     #[test]
     fn ignores_keyword_as_class_name() {
         // Reserved keywords should never be extracted as class names
-        let symbols = extract_php_symbols(
-            "<?php\nnamespace App;\nclass Foo {}\n$x = SomeClass::class;\n",
-        );
+        let symbols =
+            extract_php_symbols("<?php\nnamespace App;\nclass Foo {}\n$x = SomeClass::class;\n");
         assert_eq!(symbols, vec!["App\\Foo"]);
         // The ::class constant should not generate any extra entry
     }

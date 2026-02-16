@@ -1,3 +1,4 @@
+use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -41,8 +42,20 @@ pub fn run(targets: Vec<VerifyTarget>) -> serde_json::Value {
         .filter_map(|target| {
             let path = Path::new(&target.path);
 
-            let contents = match fs::read(path) {
-                Ok(c) => c,
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
+                Err(e) => {
+                    return Some(VerifyFailure {
+                        name: target.name.clone(),
+                        expected: target.expected_hash.clone(),
+                        actual: String::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            };
+
+            let mmap = match unsafe { Mmap::map(&file) } {
+                Ok(m) => m,
                 Err(e) => {
                     return Some(VerifyFailure {
                         name: target.name.clone(),
@@ -56,12 +69,12 @@ pub fn run(targets: Vec<VerifyTarget>) -> serde_json::Value {
             let actual_hash = match target.algorithm.as_str() {
                 "sha256" => {
                     let mut hasher = Sha256::new();
-                    hasher.update(&contents);
+                    hasher.update(&mmap[..]);
                     format!("{:x}", hasher.finalize())
                 }
                 "sha1" => {
                     let mut hasher = Sha1::new();
-                    hasher.update(&contents);
+                    hasher.update(&mmap[..]);
                     format!("{:x}", hasher.finalize())
                 }
                 other => {
@@ -202,10 +215,7 @@ mod tests {
         let result = run(targets);
         assert_eq!(result["verified"].as_u64().unwrap(), 0);
         let failed = result["failed"].as_array().unwrap();
-        assert!(failed[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported"));
+        assert!(failed[0]["error"].as_str().unwrap().contains("unsupported"));
     }
 
     #[test]

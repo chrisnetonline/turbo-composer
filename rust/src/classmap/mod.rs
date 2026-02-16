@@ -123,15 +123,16 @@ pub fn run(
     // Use first-wins semantics to match Composer's behaviour
     let mut classmap: BTreeMap<String, String> = BTreeMap::new();
     for (class, path) in &walk_result.entries {
-        classmap.entry(class.clone()).or_insert_with(|| path.clone());
+        classmap
+            .entry(class.clone())
+            .or_insert_with(|| path.clone());
     }
     let sort_ms = sort_start.elapsed().as_millis();
 
     let gen_start = std::time::Instant::now();
     let classmap_count = classmap.len();
 
-    let base_real =
-        fs::canonicalize(&project_dir).unwrap_or_else(|_| PathBuf::from(&project_dir));
+    let base_real = fs::canonicalize(&project_dir).unwrap_or_else(|_| PathBuf::from(&project_dir));
     let base_str = base_real.to_string_lossy().to_string();
 
     let classmap_file_content = generate_classmap_file(&classmap, &vendor_str, &base_str);

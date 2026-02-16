@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use super::cache::{get_mtime, dirs_unchanged, CacheData, CachedFile, CACHE_VERSION};
+use super::cache::{dirs_unchanged, get_mtime, CacheData, CachedFile, CACHE_VERSION};
 use super::parser::{contains_class_keyword, extract_php_symbols};
 
 pub(crate) type ParseResult = Option<(Vec<(String, String)>, String, CachedFile)>;
@@ -147,11 +147,7 @@ fn walk_and_parse_cached(
 }
 
 /// Full path: walk all directories, parse PHP files, collect dir mtimes.
-fn walk_and_parse_full(
-    dirs: &[&str],
-    excludes: &[Regex],
-    cache: &CacheData,
-) -> WalkResult {
+fn walk_and_parse_full(dirs: &[&str], excludes: &[Regex], cache: &CacheData) -> WalkResult {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut walk_dirs: Vec<&str> = Vec::new();
 
@@ -174,10 +170,7 @@ fn walk_and_parse_full(
 
     if !walk_dirs.is_empty() {
         let mut builder = WalkBuilder::new(walk_dirs[0]);
-        builder
-            .hidden(false)
-            .git_ignore(false)
-            .threads(num_cpus());
+        builder.hidden(false).git_ignore(false).threads(num_cpus());
 
         for dir in &walk_dirs[1..] {
             builder.add(dir);
@@ -322,10 +315,8 @@ fn parse_one_file(
         files_scanned.fetch_add(1, Ordering::Relaxed);
     }
 
-    let entries: Vec<(String, String)> = symbols
-        .into_iter()
-        .map(|s| (s, path_str.clone()))
-        .collect();
+    let entries: Vec<(String, String)> =
+        symbols.into_iter().map(|s| (s, path_str.clone())).collect();
     Some((entries, path_str, cache_entry))
 }
 
