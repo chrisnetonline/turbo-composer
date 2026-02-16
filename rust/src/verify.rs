@@ -1,3 +1,4 @@
+use memmap2::Mmap;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
@@ -41,8 +42,8 @@ pub fn run(targets: Vec<VerifyTarget>) -> serde_json::Value {
         .filter_map(|target| {
             let path = Path::new(&target.path);
 
-            let contents = match fs::read(path) {
-                Ok(c) => c,
+            let file = match fs::File::open(path) {
+                Ok(f) => f,
                 Err(e) => {
                     return Some(VerifyFailure {
                         name: target.name.clone(),
@@ -53,15 +54,46 @@ pub fn run(targets: Vec<VerifyTarget>) -> serde_json::Value {
                 }
             };
 
+            let file_len = match file.metadata() {
+                Ok(m) => m.len(),
+                Err(e) => {
+                    return Some(VerifyFailure {
+                        name: target.name.clone(),
+                        expected: target.expected_hash.clone(),
+                        actual: String::new(),
+                        error: Some(e.to_string()),
+                    });
+                }
+            };
+
+            // mmap cannot map zero-length files; use an empty slice instead.
+            let mmap = if file_len > 0 {
+                match unsafe { Mmap::map(&file) } {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        return Some(VerifyFailure {
+                            name: target.name.clone(),
+                            expected: target.expected_hash.clone(),
+                            actual: String::new(),
+                            error: Some(e.to_string()),
+                        });
+                    }
+                }
+            } else {
+                None
+            };
+
+            let bytes: &[u8] = mmap.as_deref().unwrap_or(&[]);
+
             let actual_hash = match target.algorithm.as_str() {
                 "sha256" => {
                     let mut hasher = Sha256::new();
-                    hasher.update(&contents);
+                    hasher.update(bytes);
                     format!("{:x}", hasher.finalize())
                 }
                 "sha1" => {
                     let mut hasher = Sha1::new();
-                    hasher.update(&contents);
+                    hasher.update(bytes);
                     format!("{:x}", hasher.finalize())
                 }
                 other => {
@@ -202,10 +234,7 @@ mod tests {
         let result = run(targets);
         assert_eq!(result["verified"].as_u64().unwrap(), 0);
         let failed = result["failed"].as_array().unwrap();
-        assert!(failed[0]["error"]
-            .as_str()
-            .unwrap()
-            .contains("unsupported"));
+        assert!(failed[0]["error"].as_str().unwrap().contains("unsupported"));
     }
 
     #[test]
@@ -233,6 +262,48 @@ mod tests {
         let result = run(targets);
         assert_eq!(result["verified"].as_u64().unwrap(), 10);
         assert_eq!(result["total"].as_u64().unwrap(), 10);
+        assert!(result["failed"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verify_empty_file_sha256() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("empty.bin");
+        fs::File::create(&file).unwrap();
+
+        // SHA-256 of empty input
+        let expected = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let targets = vec![VerifyTarget {
+            path: file.to_string_lossy().to_string(),
+            name: "empty-file".to_string(),
+            algorithm: "sha256".to_string(),
+            expected_hash: expected.to_string(),
+        }];
+
+        let result = run(targets);
+        assert_eq!(result["verified"].as_u64().unwrap(), 1);
+        assert!(result["failed"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn verify_empty_file_sha1() {
+        let tmp = TempDir::new().unwrap();
+        let file = tmp.path().join("empty.bin");
+        fs::File::create(&file).unwrap();
+
+        // SHA-1 of empty input
+        let expected = "da39a3ee5e6b4b0d3255bfef95601890afd80709";
+
+        let targets = vec![VerifyTarget {
+            path: file.to_string_lossy().to_string(),
+            name: "empty-file".to_string(),
+            algorithm: "sha1".to_string(),
+            expected_hash: expected.to_string(),
+        }];
+
+        let result = run(targets);
+        assert_eq!(result["verified"].as_u64().unwrap(), 1);
         assert!(result["failed"].as_array().unwrap().is_empty());
     }
 

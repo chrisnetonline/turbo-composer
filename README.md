@@ -10,10 +10,10 @@ Rust-powered Composer acceleration: parallel extraction, fast classmap generatio
 
 ## Features
 
-- **Fast classmap generation** — byte-scanning PHP tokenizer with parallel directory walking, up to 3.6x faster than Composer's built-in classmap generator
+- **Fast classmap generation** — byte-scanning PHP tokenizer with parallel directory walking, up to 3.9x faster than Composer's built-in classmap generator
 - **Incremental caching** — caches symbols by file mtime with directory-level cache; warm runs skip entire directory walks and vendor stat calls
 - **Parallel package extraction** — extracts zip/tar archives using Rust + rayon for parallel I/O
-- **Parallel integrity verification** — SHA256/SHA1 hash verification of package archives, ~6.6x faster than PHP's `hash_file()`
+- **Parallel integrity verification** — SHA256/SHA1 hash verification of package archives, ~7x faster than PHP's `hash_file()`
 - **Fast vendor state validation** — checks all packages are present in vendor/ in parallel, up to 13.5x faster than PHP
 - **Parallel vendor cleanup** — concurrent removal of package directories during updates/uninstalls
 - **Drop-in Composer plugin** — integrates transparently with `composer install` and `composer dump-autoload -o`
@@ -140,9 +140,9 @@ The benchmark script builds the binary if needed, creates temporary projects wit
 
 | Fixture | PHP Files | Vanilla | Turbo (cold) | Turbo (warm) |
 |---|---|---|---|---|
-| symfony-real | 4,334 | 2,493ms | 700ms (**3.6x**) | 861ms (**2.9x**) |
-| laravel-real | 5,593 | 2,796ms | 1,001ms (**2.8x**) | 871ms (**3.2x**) |
-| monolith | 8,874 | 4,393ms | 1,891ms (**2.3x**) | 1,351ms (**3.3x**) |
+| symfony-real | 4,334 | 2,728ms | 700ms (**3.9x**) | 798ms (**3.4x**) |
+| laravel-real | 5,594 | 2,607ms | 817ms (**3.2x**) | 836ms (**3.1x**) |
+| monolith | 8,874 | 3,903ms | 1,786ms (**2.2x**) | 1,258ms (**3.1x**) |
 
 Rust generates all 5 autoload data files (classmap, psr4, namespaces, files, static) in a single call. The Rust classmap engine runs in parallel with Composer's base dump via `proc_open`, so the Rust work is effectively free when it finishes before PHP. An incremental mtime cache stores parsed symbols per file, and a directory-level mtime cache skips entire directory walks and vendor stat calls on warm runs.
 
@@ -151,8 +151,8 @@ Rust generates all 5 autoload data files (classmap, psr4, namespaces, files, sta
 | Fixture | Files | Rust | PHP | Speedup |
 |---|---|---|---|---|
 | symfony-real | 200 | 25ms | 166ms | **6.6x** |
-| laravel-real | 200 | 24ms | 161ms | **6.7x** |
-| monolith | 200 | 25ms | 166ms | **6.6x** |
+| laravel-real | 200 | 24ms | 169ms | **7.0x** |
+| monolith | 200 | 24ms | 166ms | **6.6x** |
 
 Parallel SHA256 hashing using Rust's `sha2` crate + rayon, vs PHP's sequential `hash_file()`.
 
@@ -160,8 +160,8 @@ Parallel SHA256 hashing using Rust's `sha2` crate + rayon, vs PHP's sequential `
 
 | Fixture | Packages | Rust | PHP | Speedup |
 |---|---|---|---|---|
-| symfony-real | 70 | 131ms | 256ms | **1.9x** |
-| laravel-real | 76 | 11ms | 125ms | **11.3x** |
+| symfony-real | 70 | 127ms | 256ms | **1.9x** |
+| laravel-real | 76 | 9ms | 125ms | **13.3x** |
 | monolith | 115 | 9ms | 122ms | **13.5x** |
 
 Parallel check that all packages from `composer.lock` are present and non-empty in vendor/. Useful for CI warm-cache validation.

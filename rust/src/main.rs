@@ -57,8 +57,7 @@ fn main() {
     let stdin_ms = stdin_start.elapsed().as_millis();
 
     let parse_start = std::time::Instant::now();
-    let input: Input =
-        serde_json::from_str(&buf).expect("failed to parse input JSON");
+    let input: Input = serde_json::from_str(&buf).expect("failed to parse input JSON");
     let json_parse_ms = parse_start.elapsed().as_millis();
 
     let command_start = std::time::Instant::now();
@@ -85,17 +84,25 @@ fn main() {
 
     if let Some(stats) = output.get_mut("stats").and_then(|s| s.as_object_mut()) {
         stats.insert("stdin_read_ms".to_string(), serde_json::json!(stdin_ms));
-        stats.insert("json_parse_ms".to_string(), serde_json::json!(json_parse_ms));
+        stats.insert(
+            "json_parse_ms".to_string(),
+            serde_json::json!(json_parse_ms),
+        );
         stats.insert("command_ms".to_string(), serde_json::json!(command_ms));
     }
 
     let serialize_start = std::time::Instant::now();
-    let json =
-        serde_json::to_string(&output).expect("failed to serialise output");
+    let json = serde_json::to_string(&output).expect("failed to serialise output");
     let serialize_ms = serialize_start.elapsed().as_millis();
 
-    eprintln!("turbo-rust: total={}ms stdin={}ms json_parse={}ms command={}ms json_serialize={}ms",
-        total_start.elapsed().as_millis(), stdin_ms, json_parse_ms, command_ms, serialize_ms);
+    eprintln!(
+        "turbo-rust: total={}ms stdin={}ms json_parse={}ms command={}ms json_serialize={}ms",
+        total_start.elapsed().as_millis(),
+        stdin_ms,
+        json_parse_ms,
+        command_ms,
+        serialize_ms
+    );
 
     print!("{json}");
 }

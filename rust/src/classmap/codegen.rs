@@ -240,8 +240,7 @@ pub(crate) fn generate_static_file(
             let _ = writeln!(file, "        {} => ", php_var_export(ns));
             file.push_str("        array (\n");
             for (i, path) in paths.iter().enumerate() {
-                let code =
-                    static_path_code(path, vendor_dir, project_dir, &vendor_rel, &base_rel);
+                let code = static_path_code(path, vendor_dir, project_dir, &vendor_rel, &base_rel);
                 let _ = writeln!(file, "            {i} => {code},");
             }
             file.push_str("        ),\n");
@@ -285,8 +284,7 @@ pub(crate) fn generate_static_file(
     if !classmap.is_empty() {
         file.push_str("    public static $classMap = array (\n");
         for (class, abs_path) in classmap {
-            let code =
-                static_path_code(abs_path, vendor_dir, project_dir, &vendor_rel, &base_rel);
+            let code = static_path_code(abs_path, vendor_dir, project_dir, &vendor_rel, &base_rel);
             let _ = writeln!(file, "        {} => {},", php_var_export(class), code);
         }
         file.push_str("    );\n\n");
@@ -296,9 +294,13 @@ pub(crate) fn generate_static_file(
     if !file_autoloads.is_empty() {
         file.push_str("    public static $files = array (\n");
         for f in file_autoloads {
-            let code =
-                static_path_code(&f.path, vendor_dir, project_dir, &vendor_rel, &base_rel);
-            let _ = writeln!(file, "        {} => {},", php_var_export(&f.identifier), code);
+            let code = static_path_code(&f.path, vendor_dir, project_dir, &vendor_rel, &base_rel);
+            let _ = writeln!(
+                file,
+                "        {} => {},",
+                php_var_export(&f.identifier),
+                code
+            );
         }
         file.push_str("    );\n\n");
         // $files is NOT added to initializer — Composer accesses it separately
