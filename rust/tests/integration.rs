@@ -181,7 +181,9 @@ fn classmap_with_excludes_via_stdin() {
             "psr-0": [],
             "classmap": []
         },
-        "exclude_from_classmap": ["*Tests*"]
+        "exclude_from_classmap": [
+            format!("{}/Tests($|/)", regex::escape(&src_dir.to_string_lossy()))
+        ]
     });
 
     let result = run_binary(&input.to_string());

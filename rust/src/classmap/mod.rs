@@ -90,8 +90,9 @@ pub fn run(config: ClassmapConfig) -> serde_json::Value {
         .exclude_from_classmap
         .iter()
         .filter_map(|p| {
-            let re = p.replace('/', r"[/\\]").replace('*', ".*");
-            Regex::new(&re).ok()
+            // Patterns arrive as pre-built regex from PHP (absolute-path-anchored),
+            // matching Composer's exclude-from-classmap resolution.
+            Regex::new(p).ok()
         })
         .collect();
 
@@ -134,12 +135,58 @@ pub fn run(config: ClassmapConfig) -> serde_json::Value {
     let walk_parse_ms = walk_parse_start.elapsed().as_millis();
 
     let sort_start = std::time::Instant::now();
-    // Use first-wins semantics to match Composer's behaviour
+
+    // Resolve PSR-4/PSR-0/classmap base paths using the same logic as `all_dirs`
+    // so that prefix-matching against walker output is consistent.
+    let resolve_path = |d: &str| -> String {
+        if Path::new(d).is_absolute() && !d.contains("..") {
+            d.to_string()
+        } else {
+            fs::canonicalize(d)
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| d.to_string())
+        }
+    };
+
+    let psr4_resolved: Vec<(String, String)> = config
+        .autoload
+        .psr4
+        .iter()
+        .map(|m| (m.namespace.clone(), resolve_path(&m.path)))
+        .collect();
+
+    let psr0_resolved: Vec<(String, String)> = config
+        .autoload
+        .psr0
+        .iter()
+        .map(|m| (m.namespace.clone(), resolve_path(&m.path)))
+        .collect();
+
+    let classmap_resolved: Vec<String> = config
+        .autoload
+        .classmap
+        .iter()
+        .map(|d| resolve_path(d))
+        .collect();
+
+    // Use first-wins semantics to match Composer's behaviour.
+    // Filter classes by PSR-4/PSR-0 compliance — Composer only includes
+    // classes whose FQCN maps to the correct filename under the namespace
+    // mapping. Secondary classes in a file (that don't match the filename)
+    // are excluded, matching Composer's `filterByNamespace()` logic.
     let mut classmap: BTreeMap<String, String> = BTreeMap::new();
     for (class, path) in &walk_result.entries {
-        classmap
-            .entry(class.clone())
-            .or_insert_with(|| path.clone());
+        if is_class_valid(
+            class,
+            path,
+            &psr4_resolved,
+            &psr0_resolved,
+            &classmap_resolved,
+        ) {
+            classmap
+                .entry(class.clone())
+                .or_insert_with(|| path.clone());
+        }
     }
     let sort_ms = sort_start.elapsed().as_millis();
 
@@ -310,6 +357,136 @@ pub fn run(config: ClassmapConfig) -> serde_json::Value {
     serde_json::to_value(output).unwrap()
 }
 
+/// Check whether a class should be included in the classmap, applying PSR-4/PSR-0
+/// filename compliance filtering to match Composer's `filterByNamespace()` behaviour.
+///
+/// - Classes in classmap directories are always included.
+/// - Classes in PSR-4 directories must have an FQCN that maps to the file's
+///   relative path (minus extension) under the base directory.
+/// - Classes in PSR-0 directories follow PSR-0 path conventions.
+/// - Classes not matched by any mapping are included (conservative fallback).
+fn is_class_valid(
+    class: &str,
+    file_path: &str,
+    psr4: &[(String, String)],
+    psr0: &[(String, String)],
+    classmap_dirs: &[String],
+) -> bool {
+    // Classmap directories: always include all classes.
+    for cm_dir in classmap_dirs {
+        let prefix = if cm_dir.ends_with('/') {
+            cm_dir.to_string()
+        } else {
+            format!("{cm_dir}/")
+        };
+        if file_path.starts_with(&prefix) || file_path == cm_dir.as_str() {
+            return true;
+        }
+    }
+
+    // PSR-4: find the longest (most specific) matching base path.
+    let mut best_psr4: Option<(&str, &str)> = None;
+    for (ns, base) in psr4 {
+        let prefix = if base.ends_with('/') {
+            base.to_string()
+        } else {
+            format!("{base}/")
+        };
+        if file_path.starts_with(&prefix)
+            && best_psr4
+                .as_ref()
+                .is_none_or(|(_, prev_base)| base.len() > prev_base.len())
+        {
+            best_psr4 = Some((ns.as_str(), base.as_str()));
+        }
+    }
+
+    if let Some((ns_prefix, base_path)) = best_psr4 {
+        return is_psr4_compliant(class, ns_prefix, base_path, file_path);
+    }
+
+    // PSR-0: find the longest matching base path.
+    let mut best_psr0: Option<(&str, &str)> = None;
+    for (ns, base) in psr0 {
+        let prefix = if base.ends_with('/') {
+            base.to_string()
+        } else {
+            format!("{base}/")
+        };
+        if file_path.starts_with(&prefix)
+            && best_psr0
+                .as_ref()
+                .is_none_or(|(_, prev_base)| base.len() > prev_base.len())
+        {
+            best_psr0 = Some((ns.as_str(), base.as_str()));
+        }
+    }
+
+    if let Some((_, base_path)) = best_psr0 {
+        return is_psr0_compliant(class, base_path, file_path);
+    }
+
+    // Not in any known mapping — include conservatively.
+    true
+}
+
+/// PSR-4: class `Foo\Bar\Baz` with prefix `Foo\` and base `/path/to/foo`
+/// expects file at `/path/to/foo/Bar/Baz.php`.
+///
+/// Matches Composer's `filterByNamespace()` which uses positional stripping:
+/// `substr($class, strlen($baseNamespace))` — it strips N characters from the
+/// FQCN regardless of whether the class actually starts with the prefix.
+fn is_psr4_compliant(class: &str, ns_prefix: &str, base_path: &str, file_path: &str) -> bool {
+    // Strip .php extension from the relative path
+    let sep = if base_path.ends_with('/') { "" } else { "/" };
+    let rel_start = base_path.len() + sep.len();
+    if file_path.len() <= rel_start {
+        return false;
+    }
+    let relative = &file_path[rel_start..];
+    let relative = relative.strip_suffix(".php").unwrap_or(relative);
+
+    // Positional strip: remove N characters where N = namespace prefix length.
+    // This matches Composer's `substr($class, strlen($baseNamespace))`.
+    let prefix_len = ns_prefix.len();
+    let sub_class = if prefix_len > 0 && class.len() > prefix_len {
+        &class[prefix_len..]
+    } else if prefix_len == 0 {
+        class
+    } else {
+        return false;
+    };
+
+    // Convert namespace separators to path separators
+    let expected = sub_class.replace('\\', "/");
+    expected == relative
+}
+
+/// PSR-0: class `Foo\Bar_Baz` with base `/path/to/lib` expects file at
+/// `/path/to/lib/Foo/Bar/Baz.php` (namespace `\` → `/`, classname `_` → `/`).
+fn is_psr0_compliant(class: &str, base_path: &str, file_path: &str) -> bool {
+    let sep = if base_path.ends_with('/') { "" } else { "/" };
+    let rel_start = base_path.len() + sep.len();
+    if file_path.len() <= rel_start {
+        return false;
+    }
+    let relative = &file_path[rel_start..];
+    let relative = relative.strip_suffix(".php").unwrap_or(relative);
+
+    // PSR-0: split at last backslash
+    let expected = if let Some(last_bs) = class.rfind('\\') {
+        let namespace_part = &class[..last_bs + 1]; // includes trailing backslash
+        let class_name = &class[last_bs + 1..];
+        let ns_path = namespace_part.replace('\\', "/");
+        let cls_path = class_name.replace('_', "/");
+        format!("{ns_path}{cls_path}")
+    } else {
+        class.replace('_', "/")
+    };
+
+    expected == relative
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,11 +581,17 @@ mod tests {
             files: vec![],
         };
 
+        // Build exclude pattern as PHP now does: absolute-path-anchored regex.
+        // Use the same path the walker sees (not canonicalized) since on macOS
+        // /var and /private/var are different strings.
+        let src_str = src_dir.to_string_lossy().to_string();
+        let exclude_regex = format!("{}/Tests($|/)", regex::escape(&src_str));
+
         let result = run(test_config(
             tmp.path().to_string_lossy().to_string(),
             tmp.path().join("vendor").to_string_lossy().to_string(),
             autoload,
-            vec!["*Tests*".to_string()],
+            vec![exclude_regex],
             None,
             None,
             true,
@@ -605,9 +788,16 @@ mod tests {
         assert_eq!(result1["stats"]["cache_hits"].as_u64().unwrap(), 0);
 
         std::thread::sleep(std::time::Duration::from_secs(1));
+        // Rewrite Foo.php with changed content (class renamed) and add a new
+        // PSR-4-compliant file to verify cache detects the mtime change.
         fs::write(
             &foo_path,
-            "<?php\nnamespace App;\nclass Foo {}\nclass FooExtra {}\n",
+            "<?php\nnamespace App;\nclass Foo { public function changed(): void {} }\n",
+        )
+        .unwrap();
+        fs::write(
+            src_dir.join("FooExtra.php"),
+            "<?php\nnamespace App;\nclass FooExtra {}\n",
         )
         .unwrap();
 
@@ -725,5 +915,180 @@ mod tests {
         let real_content = fs::read_to_string(target_dir.join("autoload_real.php.turbo")).unwrap();
         assert!(real_content.contains("ComposerAutoloaderInittest123"));
         assert!(real_content.contains("platform_check.php"));
+    }
+
+    #[test]
+    fn psr4_compliant_class_matches_filename() {
+        assert!(is_psr4_compliant(
+            "App\\Models\\User",
+            "App\\",
+            "/project/src",
+            "/project/src/Models/User.php",
+        ));
+    }
+
+    #[test]
+    fn psr4_rejects_class_in_wrong_file() {
+        // LazyValue defined in PhpFilesAdapter.php — PSR-4 non-compliant
+        assert!(!is_psr4_compliant(
+            "Symfony\\Component\\Cache\\Adapter\\LazyValue",
+            "Symfony\\Component\\Cache\\",
+            "/vendor/symfony/cache",
+            "/vendor/symfony/cache/Adapter/PhpFilesAdapter.php",
+        ));
+    }
+
+    #[test]
+    fn psr4_primary_class_in_correct_file() {
+        assert!(is_psr4_compliant(
+            "Symfony\\Component\\Cache\\Adapter\\PhpFilesAdapter",
+            "Symfony\\Component\\Cache\\",
+            "/vendor/symfony/cache",
+            "/vendor/symfony/cache/Adapter/PhpFilesAdapter.php",
+        ));
+    }
+
+    #[test]
+    fn psr4_empty_namespace_prefix() {
+        assert!(is_psr4_compliant(
+            "GlobalClass",
+            "",
+            "/project/lib",
+            "/project/lib/GlobalClass.php",
+        ));
+    }
+
+    #[test]
+    fn psr4_positional_strip_matches_composer_behaviour() {
+        // Composer uses positional stripping: substr($class, strlen($ns_prefix)).
+        // If the prefix length happens to produce a matching path suffix, the class
+        // is accepted — even if the class doesn't actually start with the prefix.
+        // e.g. "Src\TestClass1" with prefix "App\" (both 4 chars) strips to "TestClass1"
+        assert!(is_psr4_compliant(
+            "Src\\TestClass1",
+            "App\\",
+            "/project/src",
+            "/project/src/TestClass1.php",
+        ));
+    }
+
+    #[test]
+    fn psr4_rejects_when_positional_strip_produces_wrong_path() {
+        // "Other\\Foo" with prefix "App\\" strips 4 chars → "r\\Foo" → path "r/Foo"
+        // File is at "/project/src/Foo.php" → relative is "Foo" — doesn't match "r/Foo"
+        assert!(!is_psr4_compliant(
+            "Other\\Foo",
+            "App\\",
+            "/project/src",
+            "/project/src/Foo.php",
+        ));
+    }
+
+    #[test]
+    fn psr0_compliant_class() {
+        assert!(is_psr0_compliant(
+            "Psr\\Log\\LoggerInterface",
+            "/vendor/psr/log",
+            "/vendor/psr/log/Psr/Log/LoggerInterface.php",
+        ));
+    }
+
+    #[test]
+    fn psr0_underscore_to_path() {
+        // PSR-0: underscores in the class name (after last \) become /
+        assert!(is_psr0_compliant(
+            "Twig_Extension_Core",
+            "/vendor/twig/twig/lib",
+            "/vendor/twig/twig/lib/Twig/Extension/Core.php",
+        ));
+    }
+
+    #[test]
+    fn psr0_rejects_class_in_wrong_file() {
+        assert!(!is_psr0_compliant(
+            "Psr\\Log\\ExtraClass",
+            "/vendor/psr/log",
+            "/vendor/psr/log/Psr/Log/LoggerInterface.php",
+        ));
+    }
+
+    #[test]
+    fn is_class_valid_classmap_always_includes() {
+        // A class in a classmap directory is always included, even if PSR-4 non-compliant
+        let psr4 = vec![("App\\".to_string(), "/project/src".to_string())];
+        let classmap = vec!["/project/src".to_string()];
+        assert!(is_class_valid(
+            "App\\SecondaryClass",
+            "/project/src/MainClass.php",
+            &psr4,
+            &[],
+            &classmap,
+        ));
+    }
+
+    #[test]
+    fn is_class_valid_psr4_filters_secondary_classes() {
+        let psr4 = vec![("App\\".to_string(), "/project/src".to_string())];
+        // Primary class: matches filename
+        assert!(is_class_valid(
+            "App\\MainClass",
+            "/project/src/MainClass.php",
+            &psr4,
+            &[],
+            &[],
+        ));
+        // Secondary class: doesn't match filename — should be rejected
+        assert!(!is_class_valid(
+            "App\\SecondaryClass",
+            "/project/src/MainClass.php",
+            &psr4,
+            &[],
+            &[],
+        ));
+    }
+
+    #[test]
+    fn psr4_filters_secondary_classes_in_real_scenario() {
+        // Simulates the real Symfony case: LazyValue in PhpFilesAdapter.php
+        let tmp = TempDir::new().unwrap();
+        let src_dir = tmp.path().join("src");
+        let adapter_dir = src_dir.join("Adapter");
+        fs::create_dir_all(&adapter_dir).unwrap();
+
+        let mut f = fs::File::create(adapter_dir.join("PhpFilesAdapter.php")).unwrap();
+        writeln!(
+            f,
+            "<?php\nnamespace App\\Adapter;\nclass PhpFilesAdapter {{}}\nclass LazyValue {{}}"
+        )
+        .unwrap();
+
+        let autoload = AutoloadMappings {
+            psr4: vec![NamespaceMapping {
+                namespace: "App\\".to_string(),
+                path: src_dir.to_string_lossy().to_string(),
+            }],
+            psr0: vec![],
+            classmap: vec![],
+            files: vec![],
+        };
+
+        let result = run(test_config(
+            tmp.path().to_string_lossy().to_string(),
+            tmp.path().join("vendor").to_string_lossy().to_string(),
+            autoload,
+            vec![],
+            None,
+            None,
+            true,
+        ));
+
+        let content = result["classmap_file_content"].as_str().unwrap();
+        // PhpFilesAdapter matches PSR-4 (class name = filename)
+        assert!(content.contains("App\\\\Adapter\\\\PhpFilesAdapter"));
+        // LazyValue does NOT match PSR-4 (class name != filename)
+        assert!(
+            !content.contains("App\\\\Adapter\\\\LazyValue"),
+            "LazyValue should be excluded by PSR-4 compliance check"
+        );
     }
 }
